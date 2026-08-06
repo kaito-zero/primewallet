@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>primewallet</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="app" class="shell">
+
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark">&#9670;</span> primewallet</div>
+    <div class="topbar-actions">
+      <button id="settings-btn" class="icon-btn" title="settings" type="button">&#9881;</button>
+      <button id="lock-btn" class="icon-btn" title="lock wallet" type="button" disabled>&#128274;</button>
+    </div>
+  </header>
+
+  <section id="settings-panel" class="panel hidden">
+    <div class="panel-row">
+      <label>workdir <input id="cfg-workdir" type="text"></label>
+    </div>
+    <div class="panel-row two-col">
+      <label>peer host <input id="cfg-peer-host" type="text"></label>
+      <label>peer port <input id="cfg-peer-port" type="number"></label>
+    </div>
+    <div class="panel-row">
+      <label>mine-job target <input id="cfg-target" type="text"></label>
+    </div>
+    <div class="panel-row">
+      <button id="save-config-btn" class="secondary-btn" type="button">save</button>
+      <span id="config-status" class="muted small"></span>
+    </div>
+    <p class="muted small">
+      bin dir: <code id="cfg-bin-dir">-</code><br>
+      Changing these while mining is running isn't allowed -- stop mining first.
+    </p>
+  </section>
+
+  <section id="unlock-screen" class="screen">
+    <div class="hero-card">
+      <div class="hero-icon">&#9670;</div>
+      <h1>Welcome back</h1>
+      <p class="muted">Enter your wallet passphrase to unlock</p>
+      <input id="passphrase-input" type="password" placeholder="Passphrase" autocomplete="current-password">
+      <button id="unlock-btn" class="primary-btn" type="button">Unlock</button>
+      <div id="unlock-error" class="err small"></div>
+      <p class="muted tiny">
+        Kept in memory only, for as long as this window is running. Never
+        written to disk, never sent anywhere except to the primechain
+        binaries themselves.
+      </p>
+    </div>
+  </section>
+
+  <section id="onboarding-screen" class="screen hidden">
+    <div class="hero-card">
+      <div class="hero-icon">+</div>
+      <h1>Create your first wallet</h1>
+      <p class="muted">This becomes your mining identity -- it can hold both the prime and composite roles, or you can add more wallets later and split them.</p>
+      <input id="onboard-wallet-name" type="text" placeholder="Wallet name, e.g. main">
+      <button id="onboard-create-btn" class="primary-btn" type="button">Create wallet</button>
+      <div id="onboard-error" class="err small"></div>
+    </div>
+  </section>
+
+  <main id="main-screen" class="screen hidden">
+
+    <div id="account-switcher" class="account-switcher">
+      <button id="account-switcher-btn" class="account-pill" type="button">
+        <span id="account-avatar" class="avatar"></span>
+        <span id="account-name" class="account-name">-</span>
+        <span class="chevron">&#9662;</span>
+      </button>
+      <div id="account-dropdown" class="dropdown hidden"></div>
+    </div>
+
+    <div class="account-card">
+      <div id="account-avatar-big" class="avatar big"></div>
+      <div class="address-row">
+        <code id="account-address">-</code>
+        <button id="copy-address-btn" class="icon-btn small" title="copy address" type="button">&#10697;</button>
+      </div>
+      <div class="balance-row">
+        <span id="account-balance" class="balance">0</span>
+        <span class="balance-label">micro-units</span>
+      </div>
+
+      <div class="role-toggles">
+        <button id="toggle-prime" class="role-toggle" type="button">
+          <span class="role-dot"></span> Prime mining
+        </button>
+        <button id="toggle-composite" class="role-toggle" type="button">
+          <span class="role-dot"></span> Composite mining
+        </button>
+      </div>
+
+      <div class="action-row">
+        <button id="open-send-btn" class="secondary-btn" type="button">Send</button>
+        <button id="open-receive-btn" class="secondary-btn" type="button">Receive</button>
+      </div>
+    </div>
+
+    <div class="mining-bar">
+      <div class="mining-status">
+        <span id="mining-dot" class="dot"></span>
+        <span id="mining-label">Mining stopped</span>
+      </div>
+      <button id="mining-toggle-btn" class="primary-btn small" type="button">Start mining</button>
+    </div>
+    <div id="job-status" class="muted tiny job-status"></div>
+
+    <button id="activity-toggle" class="link-btn full" type="button">Activity &#9662;</button>
+    <section id="activity-panel" class="activity-panel hidden">
+      <pre id="log"></pre>
+    </section>
+
+  </main>
+
+  <div id="send-modal" class="modal-overlay hidden">
+    <div class="modal">
+      <div class="modal-header"><h2>Send</h2><button id="close-send-btn" class="icon-btn" type="button">&#10005;</button></div>
+      <label>From <select id="send-from"></select></label>
+      <label>To <input id="send-receiver" type="text" placeholder="pcpq1_..."></label>
+      <div class="panel-row two-col">
+        <label>Prime asset # <input id="send-prime" type="number" min="2"></label>
+        <label>Amount <input id="send-amount" type="number" min="1"></label>
+      </div>
+      <label>Fee <input id="send-fee" type="number" min="0" value="1"></label>
+      <button id="send-submit-btn" class="primary-btn" type="button">Send</button>
+      <div id="send-result" class="muted small"></div>
+    </div>
+  </div>
+
+  <div id="receive-modal" class="modal-overlay hidden">
+    <div class="modal">
+      <div class="modal-header"><h2>Receive</h2><button id="close-receive-btn" class="icon-btn" type="button">&#10005;</button></div>
+      <p class="muted small">Share this address to receive PRIME transfers.</p>
+      <code id="receive-address" class="address-block"></code>
+      <button id="copy-receive-btn" class="secondary-btn" type="button">Copy address</button>
+    </div>
+  </div>
+
+  <div id="create-modal" class="modal-overlay hidden">
+    <div class="modal">
+      <div class="modal-header"><h2>Create wallet</h2><button id="close-create-btn" class="icon-btn" type="button">&#10005;</button></div>
+      <input id="create-wallet-name" type="text" placeholder="Wallet name">
+      <button id="create-submit-btn" class="primary-btn" type="button">Create</button>
+      <div id="create-error" class="err small"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+</div>
+<script src="/app.js"></script>
+</body>
+</html>
+</content>
