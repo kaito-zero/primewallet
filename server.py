@@ -49,6 +49,14 @@ SYNC_TIMEOUT_SECONDS = 900
 DEFAULT_CLI_TIMEOUT_SECONDS = 60
 WALLET_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
+# The largest legitimate POST body is a base64-encoded wallet import
+# (a wallet file is a few KB, so even generously that's under 1 MiB
+# once encoded). 16 MiB leaves plenty of headroom without accepting an
+# unbounded Content-Length -- not remotely exploitable since this only
+# binds to 127.0.0.1, but a stray/misbehaving local process forcing an
+# oversized read shouldn't be free to force memory pressure either.
+MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024
+
 
 class CliError(Exception):
     """Raised when a primechain-client/-wallet/-send invocation fails,
@@ -1112,7 +1120,13 @@ def validate_binaries(bin_dir):
     return problems
 
 
-state = None  # AppState, set in main()
+# Module-level placeholder, not the real state -- Handler's methods
+# close over this name and look it up at call time, by which point
+# main() (via `global state`) has already replaced it with the real
+# AppState built from parsed args. Declared here only so every Handler
+# method can reference `state` without each needing its own `global`
+# line; nothing reads it before main() runs.
+state = None
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -1142,6 +1156,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0) or 0)
         if length == 0:
             return {}
+        if length > MAX_REQUEST_BODY_BYTES:
+            raise CliError(f"request body too large ({length} bytes, max {MAX_REQUEST_BODY_BYTES})")
         raw = self.rfile.read(length)
         try:
             return json.loads(raw)
