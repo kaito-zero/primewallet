@@ -233,9 +233,16 @@ class WalletRegistry:
         dead end if this is the only wallet, or the one whose passphrase
         is the reason you're here."""
         path = self.named_wallet_path(name)
-        if not path.exists():
-            raise CliError(f"no wallet named '{name}'")
-        path.unlink()
+        # unlink() directly rather than checking exists() first: two
+        # concurrent deletes of the same wallet (a double-click, two
+        # tabs) would otherwise both pass the check, and the second's
+        # unlink() would crash with an unhandled FileNotFoundError --
+        # confirmed live. Racing the OS call itself instead of a
+        # separate check-then-act pair closes the window entirely.
+        try:
+            path.unlink()
+        except FileNotFoundError as exc:
+            raise CliError(f"no wallet named '{name}'") from exc
         active = self._read_active()
         cleared = [r for r, n in active.items() if n == name]
         if cleared:
@@ -341,6 +348,26 @@ class AppState:
         # back to the last holdings that *did* load for that wallet.
         self.holdings_lock = threading.Lock()
         self.holdings_cache = {}  # name -> (monotonic_time, holdings_list)
+
+        # Every operation that mutates the wallet registry -- create,
+        # import, activate, delete, rekey -- does a read-then-write on
+        # either a wallet file or active.json, neither of which is
+        # atomic across the two steps. Two concurrent requests can both
+        # pass a "does this already exist" / read a stale active.json
+        # before either has written, and one write silently clobbers
+        # the other. Confirmed live for create(): two concurrent
+        # requests for the same not-yet-existing name both "succeed",
+        # each reporting its own freshly-generated address, but only
+        # one keypair actually survives on disk -- whoever wrote last
+        # wins. Anyone shown the *other* response's address would be
+        # looking at a receive address for a private key that was
+        # generated and then immediately discarded, unrecoverable from
+        # that point on. Serializing every registry mutation behind one
+        # lock closes all of these at once; it's low-frequency enough
+        # (nobody's creating/activating/deleting wallets in a hot loop)
+        # that a single process-wide lock, not a per-name one, costs
+        # nothing in practice.
+        self.wallet_mutation_lock = threading.Lock()
 
         # Activity (wallet-history + wallet-pending + reward-history) has
         # no live-network shortcut the way balances do -- wallet-history
@@ -1347,8 +1374,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not name:
             raise CliError("wallet name is required")
         registry = state.wallets
-        address = registry.create(name, state.bin_dir, env)
-        self._auto_assign_roles(registry, name, body.get("activate_as"), first_ever)
+        with state.wallet_mutation_lock:
+            address = registry.create(name, state.bin_dir, env)
+            self._auto_assign_roles(registry, name, body.get("activate_as"), first_ever)
         state.invalidate_probe_cache()
         self._send_json({"name": name, "address": address})
 
@@ -1366,8 +1394,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (binascii.Error, ValueError) as exc:
             raise CliError(f"could not decode uploaded wallet file: {exc}") from exc
         registry = state.wallets
-        address = registry.import_wallet(name, data, state.bin_dir, env)
-        self._auto_assign_roles(registry, name, body.get("activate_as"), first_ever)
+        with state.wallet_mutation_lock:
+            address = registry.import_wallet(name, data, state.bin_dir, env)
+            self._auto_assign_roles(registry, name, body.get("activate_as"), first_ever)
         state.invalidate_probe_cache()
         self._send_json({"name": name, "address": address})
 
@@ -1380,7 +1409,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise CliError("role and name are required")
         if role in ("prime", "composite") and state.is_mining_running():
             raise CliError("stop mining before switching the active wallet")
-        state.wallets.set_active(role, name)
+        with state.wallet_mutation_lock:
+            state.wallets.set_active(role, name)
         state.invalidate_probe_cache()
         self._send_json({"activated": {role: name}})
 
@@ -1396,7 +1426,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise CliError("wallet name is required")
         if confirm != name:
             raise CliError("confirmation name doesn't match")
-        state.wallets.delete(name)
+        with state.wallet_mutation_lock:
+            state.wallets.delete(name)
         state.invalidate_probe_cache()
         self._send_json({"deleted": name})
 
@@ -1423,24 +1454,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
         rekey_env = dict(env)
         rekey_env["PRIMECHAIN_WALLET_NEW_PASSPHRASE"] = new_passphrase
         succeeded, failed = [], []
-        for name in names:
-            path = registry.named_wallet_path(name)
-            rc, out = run_binary(state.bin_dir / "primechain-wallet", ["rekey", str(path)], rekey_env)
-            if rc == 0:
-                succeeded.append(name)
-            else:
-                failed.append({"name": name, "error": out.strip()})
+        with state.wallet_mutation_lock:
+            for name in names:
+                path = registry.named_wallet_path(name)
+                rc, out = run_binary(state.bin_dir / "primechain-wallet", ["rekey", str(path)], rekey_env)
+                if rc == 0:
+                    succeeded.append(name)
+                else:
+                    failed.append({"name": name, "error": out.strip()})
 
-        if succeeded:
-            with state.lock:
-                state.passphrase = new_passphrase
-            # canonical prime.wallet/composite.wallet are byte copies of
-            # whichever named wallet is active -- refresh any that just
-            # got rekeyed so the copy matches the new ciphertext too.
-            active = registry.active_names()
-            for role, name in active.items():
-                if name in succeeded:
-                    registry.set_active(role, name)
+            if succeeded:
+                with state.lock:
+                    state.passphrase = new_passphrase
+                # canonical prime.wallet/composite.wallet are byte copies of
+                # whichever named wallet is active -- refresh any that just
+                # got rekeyed so the copy matches the new ciphertext too.
+                active = registry.active_names()
+                for role, name in active.items():
+                    if name in succeeded:
+                        registry.set_active(role, name)
 
         self._send_json({"succeeded": succeeded, "failed": failed})
 
