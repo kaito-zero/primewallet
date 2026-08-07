@@ -429,6 +429,8 @@ input[readonly] { opacity: 0.7; cursor: default; }
 .activity-row.out .activity-row-amount { color: var(--text); }
 .activity-row.fee .activity-row-amount,
 .activity-row.fee .activity-row-label { color: var(--muted); }
+.activity-row.reward .activity-row-amount,
+.activity-row.reward .activity-row-label { color: var(--accent); }
 .activity-row.pending { opacity: 0.7; }
 .pending-badge {
   margin-left: 0.4rem;

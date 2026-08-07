@@ -346,11 +346,18 @@ function renderActivityList(data) {
     const row = document.createElement("div");
     const isReceived = ev.direction === "received";
     const isFee = ev.direction === "fee-paid";
-    row.className = "activity-row " + (isReceived ? "in" : isFee ? "fee" : "out") + (ev.pending ? " pending" : "");
+    const isReward = !!ev.reward;
+    row.className = "activity-row " + (isReward ? "in reward" : isReceived ? "in" : isFee ? "fee" : "out") + (ev.pending ? " pending" : "");
 
     const label = document.createElement("div");
     label.className = "activity-row-label";
-    if (isFee) {
+    if (isReward) {
+      // Mining/fee rewards aren't a transfer between two addresses --
+      // they're a ledger credit for having provided (or been paid out
+      // for) a record. No "from" to show, just what it was for.
+      const rewardLabel = { prime: "Mined (prime)", composite: "Mined (composite)", fee: "Fee reward" };
+      label.textContent = rewardLabel[ev.kind] || "Mining reward";
+    } else if (isFee) {
       label.textContent = "Network fee";
     } else {
       const other = isReceived ? ev.sender : ev.receiver;
@@ -366,7 +373,11 @@ function renderActivityList(data) {
 
     const amount = document.createElement("div");
     amount.className = "activity-row-amount";
-    amount.textContent = `${isReceived ? "+" : "-"}${ev.amount_micro_units} (#${ev.prime})`;
+    // A reward is credited under a prime asset # equal to the record's
+    // own integer (see SequentialNode::credit()) -- there's no separate
+    // "prime" field on these events the way a transfer has one.
+    const primeNumber = isReward ? ev.integer : ev.prime;
+    amount.textContent = `${isReceived || isReward ? "+" : "-"}${ev.amount_micro_units} (#${primeNumber})`;
 
     row.appendChild(label);
     row.appendChild(amount);

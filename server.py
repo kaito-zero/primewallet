@@ -857,6 +857,33 @@ def parse_wallet_pending(text):
     return events
 
 
+def parse_reward_history(text):
+    # "REWARD prime|composite|fee integer=... amount=... role=...
+    #  [source=...] record_height=..." -- mining/fee rewards aren't
+    # transactions at all (see SequentialNode::credit()), they're a
+    # direct ledger credit computed from record ownership, so they
+    # never show up in wallet-history's transaction scan. This is the
+    # only way to see "you earned X for mining record Y" in Activity.
+    events = []
+    int_fields = {"integer", "amount", "source", "record_height"}
+    for line in text.splitlines():
+        if not line.startswith("REWARD "):
+            continue
+        parts = line.split()
+        fields = {"reward": True, "kind": parts[1]}
+        for token in parts[2:]:
+            if "=" not in token:
+                continue
+            key, _, value = token.partition("=")
+            fields[key] = int(value) if key in int_fields and value.isdigit() else value
+        # Normalize to the same key wallet-history uses so the frontend
+        # doesn't need a separate code path just for the amount field.
+        if "amount" in fields:
+            fields["amount_micro_units"] = fields.pop("amount")
+        events.append(fields)
+    return events
+
+
 def find_default_bin_dir():
     """primewallet is a standalone tool -- it isn't nested inside a
     primechain checkout, so there's no single "correct" relative path to
@@ -1210,13 +1237,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise CliError(f"no wallet named '{name}'")
         env = state.env_without_passphrase()
 
-        # wallet-pending (a live peer query) and wallet-history (a full
-        # local chain.dat replay -- the slow one) don't depend on each
-        # other -- run them concurrently instead of paying both
-        # latencies back-to-back.
+        # wallet-pending (a live peer query), wallet-history (a full
+        # local chain.dat replay), and reward-history (another full
+        # replay, computed independently) don't depend on each other --
+        # run them concurrently instead of paying all three latencies
+        # back-to-back.
         chain_path = state.workdir / "data" / "chain.dat"
         history_needed = state.workdir_initialized() and chain_path.exists()
         history_result = {}
+        reward_result = {}
 
         def fetch_history():
             rc, out = run_binary(
@@ -1227,10 +1256,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
             history_result["rc"] = rc
             history_result["out"] = out
 
+        # Mining/fee rewards aren't transactions -- they're a direct
+        # ledger credit computed from record ownership (see
+        # SequentialNode::credit()), so wallet-history's transaction
+        # scan never sees them. reward-history recomputes them the same
+        # way `rewards` does, but it's workdir-scoped (whichever wallet
+        # is *currently* the canonical prime/composite identity), not
+        # wallet-scoped -- so it's only meaningful, and only fetched,
+        # for the wallet that's actually in that seat right now. A
+        # wallet that mined in the past but was later swapped out won't
+        # show those old rewards; that's the same limitation `rewards`
+        # already has, not something new here.
+        active = state.wallets.active_names()
+        rewards_needed = history_needed and name in (active.get("prime"), active.get("composite"))
+
+        def fetch_rewards():
+            rc, out = run_binary(
+                state.bin_dir / "primechain-client",
+                ["reward-history", str(state.workdir), "--last", "20"],
+                env,
+            )
+            reward_result["rc"] = rc
+            reward_result["out"] = out
+
         history_thread = None
         if history_needed:
             history_thread = threading.Thread(target=fetch_history)
             history_thread.start()
+        reward_thread = None
+        if rewards_needed:
+            reward_thread = threading.Thread(target=fetch_rewards)
+            reward_thread.start()
 
         pending = []
         rc_p, out_p = run_binary(
@@ -1250,11 +1306,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         history_thread.join()
         if history_result["rc"] != 0:
             raise CliError(f"could not read wallet history: {history_result['out'].strip()}")
-        # wallet-history prints oldest-to-newest; the UI wants newest
-        # first, with still-pending (mempool) events on top of that
-        # since they're newer than anything already in a record.
+        # wallet-history prints oldest-to-newest; reversing gives newest
+        # first, matching the order everything else is displayed in.
         confirmed = list(reversed(parse_wallet_history(history_result["out"])))
-        self._send_json({"events": pending + confirmed, "synced": True})
+
+        rewards = []
+        if reward_thread is not None:
+            reward_thread.join()
+            if reward_result["rc"] == 0:
+                rewards = parse_reward_history(reward_result["out"])
+            # A failed reward check shouldn't block the rest of Activity
+            # either -- same reasoning as a failed pending check.
+
+        # Interleave rewards into the confirmed list by the record they
+        # belong to, newest first, instead of bucketing them separately
+        # -- a reward and the transfers in the record that earned it
+        # happened at the same moment.
+        confirmed_and_rewards = sorted(confirmed + rewards, key=lambda ev: ev.get("integer", 0), reverse=True)
+        self._send_json({"events": pending + confirmed_and_rewards, "synced": True})
 
     def _handle_wallet_holdings(self):
         # A live GET_BALANCE query, same as the total-balance path -- but
