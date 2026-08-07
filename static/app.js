@@ -400,8 +400,18 @@ function renderMiningBar(state) {
   const viewedWalletIsMining = running && !!viewedWallet && viewedWallet.active_roles.length > 0;
   const minerWallet = running ? state.wallets.find((w) => w.active_roles.length > 0) : null;
 
-  dot.className = "dot" + (viewedWalletIsMining ? " running" : !running && state.mining_failed ? " failed" : "");
-  if (viewedWalletIsMining) {
+  // run-jobs doesn't exit or fail when it can't decrypt the mining
+  // identity's signing key -- it just keeps syncing and retrying
+  // forever, logging the error but never surfacing it. Left alone,
+  // that looks identical to genuinely mining: green dot, "Mining
+  // running", zero indication a winning proof can never actually be
+  // submitted. Show it as its own distinct state instead.
+  const authBroken = running && state.mining_auth_broken;
+
+  dot.className = "dot" + (authBroken ? " failed" : viewedWalletIsMining ? " running" : !running && state.mining_failed ? " failed" : "");
+  if (authBroken) {
+    label.textContent = "Mining running, but can't sign -- wrong passphrase for the mining wallet";
+  } else if (viewedWalletIsMining) {
     label.textContent = "Mining running";
   } else if (running) {
     label.textContent = minerWallet ? `Mining running with ${minerWallet.name}` : "Mining running";
@@ -452,10 +462,22 @@ function renderSendFrom(state) {
     opt.textContent = `${w.name} (${shortAddress(w.address)})`;
     select.appendChild(opt);
   }
-  if ([...select.options].some((o) => o.value === prev)) {
+  const stillValid = [...select.options].some((o) => o.value === prev);
+  if (stillValid) {
     select.value = prev;
   } else if (selectedWalletName) {
     select.value = selectedWalletName;
+    // The previous "From" wallet vanished out from under the Send modal
+    // (e.g. deleted while it was open) and this rebuild just silently
+    // switched it to a different one. Setting .value programmatically
+    // doesn't fire "change", so without this the holdings/prime-asset/
+    // fee shown would keep describing the wallet that's no longer
+    // selected. Only refetch if the modal is actually open and the
+    // wallet genuinely changed -- not on every ordinary 3s poll.
+    const modalOpen = !el("send-modal").classList.contains("hidden");
+    if (modalOpen && prev && prev !== selectedWalletName) {
+      refreshSendHoldings();
+    }
   }
 }
 
@@ -468,9 +490,24 @@ function renderGlobalMiningBanner(state) {
   setHidden("global-mining-banner", !state.mining_running);
   if (!state.mining_running) return;
   const frontier = (state.job_status || {}).LOCAL_FRONTIER;
-  el("global-mining-text").textContent = frontier
-    ? `Mining is running · local frontier: ${frontier}`
-    : "Mining is running";
+  const banner = el("global-mining-banner");
+  const dot = el("global-mining-dot");
+  if (state.mining_auth_broken) {
+    // Same reasoning as renderMiningBar's authBroken case -- this
+    // banner is visible even locked/on every screen, so it's the one
+    // place a "running but can never actually mine anything" state is
+    // guaranteed to be seen.
+    banner.classList.add("warn");
+    dot.className = "dot failed";
+    el("global-mining-text").textContent =
+      "Mining is running, but can't sign -- wrong passphrase for the mining wallet. Stop it, unlock with the right one, and start again.";
+  } else {
+    banner.classList.remove("warn");
+    dot.className = "dot running";
+    el("global-mining-text").textContent = frontier
+      ? `Mining is running · local frontier: ${frontier}`
+      : "Mining is running";
+  }
 }
 
 function renderAll(state) {
@@ -998,7 +1035,7 @@ onClick("mining-toggle-btn", async () => {
   // starting mining can be quiet for a while (fresh sync) -- open the
   // log automatically so progress is visible without hunting for the toggle
   show("activity-panel");
-  el("activity-toggle").textContent = "Activity ▴";
+  el("activity-toggle").textContent = "Mining log ▴";
 });
 
 onClick("global-mining-stop-btn", async () => {
@@ -1007,7 +1044,7 @@ onClick("global-mining-stop-btn", async () => {
 
 el("activity-toggle").addEventListener("click", () => {
   const hidden = el("activity-panel").classList.toggle("hidden");
-  el("activity-toggle").textContent = hidden ? "Activity ▾" : "Activity ▴";
+  el("activity-toggle").textContent = hidden ? "Mining log ▾" : "Mining log ▴";
 });
 
 el("open-send-btn").addEventListener("click", openSendModal);
