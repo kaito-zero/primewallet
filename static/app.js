@@ -67,6 +67,19 @@ async function copyToClipboard(text) {
   }
 }
 
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result; // "data:...;base64,AAAA..."
+      const comma = result.indexOf(",");
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.onerror = () => reject(new Error("could not read file"));
+    reader.readAsDataURL(file);
+  });
+}
+
 function onClick(id, handler) {
   el(id).addEventListener("click", async (ev) => {
     ev.preventDefault();
@@ -112,9 +125,18 @@ function pickSelectedWallet(state) {
 
 function renderScreens(state) {
   const unlocked = state.config.unlocked;
-  setHidden("unlock-screen", unlocked);
-  setHidden("onboarding-screen", !unlocked || state.wallets.length > 0);
-  setHidden("main-screen", !unlocked || state.wallets.length === 0);
+  // three screens, mutually exclusive:
+  //  - unlock: a wallet already exists on disk, just need the passphrase
+  //  - setup:  nothing exists yet (or somehow unlocked with 0 wallets) --
+  //            create a new one or import a backup .wallet file
+  //  - main:   unlocked and at least one wallet is registered
+  const showUnlock = !unlocked && state.has_any_wallet;
+  const showSetup = (!unlocked && !state.has_any_wallet) || (unlocked && state.wallets.length === 0);
+  const showMain = unlocked && state.wallets.length > 0;
+  setHidden("unlock-screen", !showUnlock);
+  setHidden("onboarding-screen", !showSetup);
+  setHidden("main-screen", !showMain);
+  setHidden("onboard-passphrase", unlocked); // already unlocked -- no need to ask again
   el("lock-btn").disabled = !unlocked;
 }
 
@@ -216,13 +238,24 @@ function renderAccountCard(state, name) {
   balanceEl.textContent = wallet.total_micro_units;
 
   for (const [btn, role] of [[primeBtn, "prime"], [compositeBtn, "composite"]]) {
-    btn.classList.toggle("active", wallet.active_roles.includes(role));
+    const isAssigned = wallet.active_roles.includes(role);
+    // "assigned" (this wallet is designated for the role) and "actually
+    // mining right now" (the global run-jobs process is up) are
+    // different things -- a wallet can be assigned while mining is
+    // stopped. Green/active only when both are true, so the button
+    // doesn't look like it's mining when nothing is running.
+    btn.classList.toggle("active", isAssigned && running);
+    btn.classList.toggle("assigned", isAssigned && !running);
     btn.disabled = running; // switching the active wallet mid-run isn't allowed server-side
-    btn.title = running
-      ? "stop mining to change role assignment"
-      : wallet.active_roles.includes(role)
-        ? `this wallet currently mines the ${role} role -- click to keep it, pick another wallet to move it`
+    if (running) {
+      btn.title = isAssigned
+        ? `currently mining the ${role} role`
+        : "stop mining to change role assignment";
+    } else {
+      btn.title = isAssigned
+        ? `assigned to mine the ${role} role once you start -- click to keep it, pick another wallet to move it`
         : `make this wallet the ${role} miner`;
+    }
   }
 }
 
@@ -254,6 +287,7 @@ function renderMiningBar(state) {
   el("job-status").textContent = entries.length
     ? entries.map(([k, v]) => `${k}: ${v}`).join("  ·  ")
     : "";
+  el("job-status").classList.toggle("active", running);
 }
 
 function renderSendFrom(state) {
@@ -273,11 +307,26 @@ function renderSendFrom(state) {
   }
 }
 
+function renderGlobalMiningBanner(state) {
+  // Deliberately independent of screen/wallet state -- a mining process
+  // reads the canonical wallet files directly, not the named ones, so
+  // it can keep running even with zero named wallets around (e.g. the
+  // one that was active got deleted). If it's running, there must
+  // always be a visible way to see that and stop it.
+  setHidden("global-mining-banner", !state.mining_running);
+  if (!state.mining_running) return;
+  const frontier = (state.job_status || {}).LOCAL_FRONTIER;
+  el("global-mining-text").textContent = frontier
+    ? `Mining is running · local frontier: ${frontier}`
+    : "Mining is running";
+}
+
 function renderAll(state) {
   if (!state) return;
   lastState = state;
   renderScreens(state);
   renderSettings(state);
+  renderGlobalMiningBanner(state);
   if (!state.config.unlocked || state.wallets.length === 0) return;
   const name = pickSelectedWallet(state);
   renderAccountSwitcher(state, name);
@@ -287,10 +336,22 @@ function renderAll(state) {
   renderSendFrom(state);
 }
 
+let stateRequestInFlight = false;
+
 async function refreshState() {
-  const state = await api("/api/state");
-  renderAll(state);
-  return state;
+  // /api/state shells out to primechain-client for balances/job-status;
+  // on a slow disk (e.g. mid-sync) one call can take longer than the
+  // poll interval. Never let a new one stack on top of a slow one --
+  // that's how a burst of overlapping subprocesses piles up.
+  if (stateRequestInFlight) return lastState;
+  stateRequestInFlight = true;
+  try {
+    const state = await api("/api/state");
+    renderAll(state);
+    return state;
+  } finally {
+    stateRequestInFlight = false;
+  }
 }
 
 async function refreshLog() {
@@ -334,9 +395,31 @@ for (const id of ["cfg-workdir", "cfg-peer-host", "cfg-peer-port", "cfg-target"]
   el(id).addEventListener("input", () => { settingsTouched = true; });
 }
 
-el("settings-btn").addEventListener("click", () => {
-  el("settings-panel").classList.toggle("hidden");
-});
+function switchSettingsTab(tab) {
+  const isConfig = tab === "config";
+  el("tab-btn-config").classList.toggle("active", isConfig);
+  el("tab-btn-wallets").classList.toggle("active", !isConfig);
+  setHidden("tab-panel-config", !isConfig);
+  setHidden("tab-panel-wallets", isConfig);
+  if (!isConfig) {
+    deleteConfirmTarget = null;
+    el("rekey-new-passphrase").value = "";
+    el("rekey-confirm-passphrase").value = "";
+    el("rekey-error").textContent = "";
+    el("rekey-result").textContent = "";
+    refreshManageList();
+  }
+}
+
+function openSettings(tab) {
+  show("settings-modal");
+  switchSettingsTab(tab || "config");
+}
+
+el("settings-btn").addEventListener("click", () => openSettings("config"));
+el("close-settings-btn").addEventListener("click", () => hide("settings-modal"));
+el("tab-btn-config").addEventListener("click", () => switchSettingsTab("config"));
+el("tab-btn-wallets").addEventListener("click", () => switchSettingsTab("wallets"));
 
 onClick("save-config-btn", async () => {
   const workdir = el("cfg-workdir").value.trim();
@@ -382,18 +465,31 @@ onClick("lock-btn", async () => {
   selectedWalletName = null;
 });
 
+async function ensureUnlockedForSetup() {
+  if (lastState && lastState.config.unlocked) return;
+  const passphrase = el("onboard-passphrase").value;
+  if (!passphrase) throw new Error("choose a passphrase first");
+  await api("/api/unlock", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ passphrase }),
+  });
+}
+
 onClick("onboard-create-btn", async () => {
   const input = el("onboard-wallet-name");
   const name = input.value.trim();
   el("onboard-error").textContent = "";
   if (!name) throw new Error("enter a wallet name first");
   try {
+    await ensureUnlockedForSetup();
     const result = await api("/api/wallets/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name }),
     });
     selectedWalletName = result.name;
+    el("onboard-passphrase").value = "";
   } catch (err) {
     el("onboard-error").textContent = err.message;
     throw err;
@@ -401,6 +497,38 @@ onClick("onboard-create-btn", async () => {
 });
 el("onboard-wallet-name").addEventListener("keydown", (ev) => {
   if (ev.key === "Enter") el("onboard-create-btn").click();
+});
+el("onboard-passphrase").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") el("onboard-create-btn").click();
+});
+
+el("onboard-import-btn").addEventListener("click", () => el("onboard-import-file").click());
+el("onboard-import-file").addEventListener("change", async () => {
+  const fileInput = el("onboard-import-file");
+  const file = fileInput.files[0];
+  fileInput.value = "";
+  if (!file) return;
+  el("onboard-error").textContent = "";
+  const typedName = el("onboard-wallet-name").value.trim();
+  const name = typedName || file.name.replace(/\.wallet$/i, "");
+  if (!name) {
+    el("onboard-error").textContent = "enter a wallet name first";
+    return;
+  }
+  try {
+    await ensureUnlockedForSetup();
+    const wallet_file_b64 = await fileToBase64(file);
+    const result = await api("/api/wallets/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, wallet_file_b64 }),
+    });
+    selectedWalletName = result.name;
+    el("onboard-passphrase").value = "";
+  } catch (err) {
+    el("onboard-error").textContent = err.message;
+  }
+  await refreshState().catch((e) => console.error(e));
 });
 
 el("account-switcher-btn").addEventListener("click", (ev) => {
@@ -411,6 +539,161 @@ el("account-switcher-btn").addEventListener("click", (ev) => {
 document.addEventListener("click", (ev) => {
   if (!dropdownOpen) return;
   if (!el("account-switcher").contains(ev.target)) closeDropdown();
+});
+
+// -- manage wallets (delete) ------------------------------------------
+
+let deleteConfirmTarget = null;
+let lastManageWallets = [];
+
+async function refreshManageList() {
+  try {
+    const data = await api("/api/wallets/list_all");
+    lastManageWallets = data.wallets || [];
+  } catch (err) {
+    console.error(err);
+  }
+  renderManageList(lastManageWallets);
+}
+
+function renderManageList(wallets) {
+  const container = el("manage-wallet-list");
+  container.innerHTML = "";
+  if (!wallets || wallets.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "muted small";
+    empty.textContent = "No wallets found in this workdir yet.";
+    container.appendChild(empty);
+    return;
+  }
+  for (const w of wallets) {
+    const row = document.createElement("div");
+    row.className = "manage-row";
+
+    if (deleteConfirmTarget === w.name) {
+      const confirmWrap = document.createElement("div");
+      confirmWrap.className = "manage-confirm-row";
+      const label = document.createElement("span");
+      label.className = "small muted";
+      label.textContent = `Type "${w.name}" to permanently delete it:`;
+      const input = document.createElement("input");
+      input.type = "text";
+      input.placeholder = w.name;
+      const actions = document.createElement("div");
+      actions.className = "manage-confirm-actions";
+      const cancelBtn = document.createElement("button");
+      cancelBtn.type = "button";
+      cancelBtn.className = "manage-confirm-cancel";
+      cancelBtn.textContent = "Cancel";
+      cancelBtn.addEventListener("click", () => {
+        deleteConfirmTarget = null;
+        renderManageList(lastManageWallets);
+      });
+      const deleteBtn = document.createElement("button");
+      deleteBtn.type = "button";
+      deleteBtn.className = "manage-confirm-delete";
+      deleteBtn.textContent = "Delete permanently";
+      deleteBtn.disabled = true;
+      input.addEventListener("input", () => {
+        deleteBtn.disabled = input.value !== w.name;
+      });
+      deleteBtn.addEventListener("click", async () => {
+        deleteBtn.disabled = true;
+        try {
+          await api("/api/wallets/delete", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: w.name, confirm_name: input.value }),
+          });
+          deleteConfirmTarget = null;
+          showToast(`Deleted "${w.name}"`);
+          if (selectedWalletName === w.name) selectedWalletName = null;
+        } catch (err) {
+          showToast(err.message, true);
+          deleteBtn.disabled = false;
+        }
+        await refreshManageList();
+        await refreshState().catch((e) => console.error(e));
+      });
+      actions.appendChild(cancelBtn);
+      actions.appendChild(deleteBtn);
+      confirmWrap.appendChild(label);
+      confirmWrap.appendChild(input);
+      confirmWrap.appendChild(actions);
+      row.appendChild(confirmWrap);
+      input.focus();
+    } else {
+      const info = document.createElement("div");
+      info.className = "manage-row-info";
+      const nameEl = document.createElement("div");
+      nameEl.className = "manage-row-name";
+      nameEl.textContent = w.name;
+      const addrEl = document.createElement("code");
+      addrEl.className = "manage-row-address";
+      addrEl.textContent = w.address || "(address unreadable)";
+      info.appendChild(nameEl);
+      info.appendChild(addrEl);
+      if (w.active_roles.length) {
+        const roles = document.createElement("div");
+        roles.className = "manage-row-roles muted tiny";
+        roles.textContent = `active: ${w.active_roles.join(", ")}`;
+        info.appendChild(roles);
+      }
+      const delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.className = "manage-delete-btn";
+      delBtn.textContent = "Delete";
+      delBtn.addEventListener("click", () => {
+        deleteConfirmTarget = w.name;
+        renderManageList(lastManageWallets);
+      });
+      row.appendChild(info);
+      row.appendChild(delBtn);
+    }
+    container.appendChild(row);
+  }
+}
+
+// -- change passphrase (inline in the Wallets settings tab) ------------
+
+onClick("rekey-submit-btn", async () => {
+  const next = el("rekey-new-passphrase").value;
+  const confirm = el("rekey-confirm-passphrase").value;
+  el("rekey-error").textContent = "";
+  el("rekey-result").textContent = "";
+  if (next.length < 4) throw new Error("choose a passphrase at least 4 characters long");
+  if (next !== confirm) throw new Error("passphrases don't match");
+  try {
+    const result = await api("/api/wallets/rekey", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ new_passphrase: next }),
+    });
+    el("rekey-new-passphrase").value = "";
+    el("rekey-confirm-passphrase").value = "";
+    const parts = [];
+    if (result.succeeded.length) parts.push(`changed: ${result.succeeded.join(", ")}`);
+    if (result.failed.length) parts.push(`unchanged (different passphrase): ${result.failed.map((f) => f.name).join(", ")}`);
+    el("rekey-result").textContent = parts.join("  ·  ") || "nothing to do";
+    showToast(result.succeeded.length ? "Passphrase changed" : "No wallets matched your current passphrase");
+  } catch (err) {
+    el("rekey-error").textContent = err.message;
+    throw err;
+  }
+});
+
+el("forgot-passphrase-btn").addEventListener("click", () => show("forgot-modal"));
+el("close-forgot-btn").addEventListener("click", () => hide("forgot-modal"));
+el("forgot-open-settings-btn").addEventListener("click", () => {
+  hide("forgot-modal");
+  openSettings("config");
+  el("cfg-workdir").focus();
+  el("cfg-workdir").select();
+});
+
+el("export-wallet-btn").addEventListener("click", () => {
+  if (!selectedWalletName) return;
+  window.open(`/api/wallets/export?name=${encodeURIComponent(selectedWalletName)}`, "_blank");
 });
 
 onClick("copy-address-btn", async () => {
@@ -441,7 +724,15 @@ onClick("mining-toggle-btn", async () => {
     await api("/api/mining/stop", { method: "POST" });
   } else {
     await api("/api/mining/start", { method: "POST" });
+    // starting mining can be quiet for a while (fresh sync) -- open the
+    // log automatically so progress is visible without hunting for the toggle
+    show("activity-panel");
+    el("activity-toggle").textContent = "Activity ▴";
   }
+});
+
+onClick("global-mining-stop-btn", async () => {
+  await api("/api/mining/stop", { method: "POST" });
 });
 
 el("activity-toggle").addEventListener("click", () => {
@@ -484,6 +775,34 @@ onClick("create-submit-btn", async () => {
   }
 });
 
+el("create-import-btn").addEventListener("click", () => el("create-import-file").click());
+el("create-import-file").addEventListener("change", async () => {
+  const fileInput = el("create-import-file");
+  const file = fileInput.files[0];
+  fileInput.value = "";
+  if (!file) return;
+  el("create-error").textContent = "";
+  const typedName = el("create-wallet-name").value.trim();
+  const name = typedName || file.name.replace(/\.wallet$/i, "");
+  if (!name) {
+    el("create-error").textContent = "enter a wallet name first";
+    return;
+  }
+  try {
+    const wallet_file_b64 = await fileToBase64(file);
+    const result = await api("/api/wallets/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, wallet_file_b64 }),
+    });
+    selectedWalletName = result.name;
+    closeCreateModal();
+  } catch (err) {
+    el("create-error").textContent = err.message;
+  }
+  await refreshState().catch((e) => console.error(e));
+});
+
 onClick("send-submit-btn", async () => {
   const body = {
     from: el("send-from").value,
@@ -506,14 +825,15 @@ onClick("send-submit-btn", async () => {
 });
 
 // close modals on backdrop click / Escape
-for (const overlayId of ["send-modal", "receive-modal", "create-modal"]) {
+const ALL_MODAL_IDS = ["send-modal", "receive-modal", "create-modal", "forgot-modal", "settings-modal"];
+for (const overlayId of ALL_MODAL_IDS) {
   el(overlayId).addEventListener("click", (ev) => {
     if (ev.target.id === overlayId) el(overlayId).classList.add("hidden");
   });
 }
 document.addEventListener("keydown", (ev) => {
   if (ev.key !== "Escape") return;
-  for (const overlayId of ["send-modal", "receive-modal", "create-modal"]) {
+  for (const overlayId of ALL_MODAL_IDS) {
     el(overlayId).classList.add("hidden");
   }
   closeDropdown();
@@ -522,4 +842,3 @@ document.addEventListener("keydown", (ev) => {
 refreshState().catch((err) => console.error(err));
 safeInterval(refreshState, 3000);
 safeInterval(refreshLog, 1000);
-</content>

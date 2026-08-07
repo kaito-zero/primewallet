@@ -25,14 +25,18 @@ Requires only the Python 3 standard library; nothing to install.
 """
 
 import argparse
+import base64
+import binascii
 import collections
 import http.server
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 
@@ -105,6 +109,14 @@ class WalletRegistry:
             raise CliError("role must be 'prime' or 'composite'")
         return self.workdir / "wallets" / f"{role}.wallet"
 
+    def has_any_wallet(self):
+        """Pure filesystem check, no unlock/passphrase needed -- used to
+        decide whether to show "unlock" (a wallet already exists) or
+        "create/import" (nothing here yet) on first load."""
+        if self.named_dir.is_dir() and any(self.named_dir.glob("*.wallet")):
+            return True
+        return self.canonical_path("prime").exists() or self.canonical_path("composite").exists()
+
     def create(self, name, bin_dir, env):
         path = self.named_wallet_path(name)
         if path.exists():
@@ -114,6 +126,23 @@ class WalletRegistry:
         if rc != 0:
             raise CliError(f"could not create wallet: {out.strip()}")
         return out.strip()
+
+    def import_wallet(self, name, data, bin_dir, env):
+        """Restore a wallet from raw .wallet file bytes (e.g. a backup
+        copy). Validated by reading its address back before keeping it --
+        garbage input is rejected rather than sitting there silently."""
+        path = self.named_wallet_path(name)
+        if path.exists():
+            raise CliError(f"a wallet named '{name}' already exists")
+        if not data:
+            raise CliError("wallet file is empty")
+        self.named_dir.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        try:
+            return self.address_of(name, bin_dir, env)
+        except CliError as exc:
+            path.unlink(missing_ok=True)
+            raise CliError(f"not a valid wallet file: {exc}") from exc
 
     def address_of(self, name, bin_dir, env):
         path = self.named_wallet_path(name)
@@ -134,6 +163,28 @@ class WalletRegistry:
         active = self._read_active()
         active[role] = name
         self._write_active(active)
+
+    def delete(self, name):
+        """Removes only the named copy at wallets/named/<name>.wallet.
+        Deliberately doesn't touch the canonical prime.wallet/
+        composite.wallet files -- if this wallet was active for a role,
+        that copy stays put and already-running mining is unaffected.
+        What does change is active.json: any role pointing at the
+        now-gone name is cleared, so state stays honest (no role can
+        claim a wallet that doesn't exist to select again) instead of
+        blocking the delete on "pick a replacement first" -- which is a
+        dead end if this is the only wallet, or the one whose passphrase
+        is the reason you're here."""
+        path = self.named_wallet_path(name)
+        if not path.exists():
+            raise CliError(f"no wallet named '{name}'")
+        path.unlink()
+        active = self._read_active()
+        cleared = [r for r, n in active.items() if n == name]
+        if cleared:
+            for role in cleared:
+                active[role] = None
+            self._write_active(active)
 
     def ensure_migrated_from_canonical(self):
         """If wallets/prime.wallet or wallets/composite.wallet exist (e.g.
@@ -181,6 +232,47 @@ class AppState:
         self.mining_process = None
         self.mining_log = collections.deque(maxlen=4000)
         self.mining_failed = False
+
+        # job-status reads chain.dat directly off disk; landing mid-write
+        # by a concurrent sync-download can make the read fail to parse,
+        # and primechain-client silently reports frontier=0 instead of
+        # surfacing an error (confirmed in its source -- loadLocalStatus()
+        # swallows a load failure into a zeroed-out status). Sync
+        # progress is monotonic, so track the highest value actually seen
+        # and never report a drop below it -- that's a read glitch, not
+        # real backward progress. Reset whenever a fresh sync starts.
+        self.frontier_floor = 0
+
+        # balances/job-status shell out to primechain-client and read
+        # the workdir's chain.dat -- while a sync is actively writing to
+        # that file, each call can take a while. Without this, every
+        # concurrent /api/state request (multiple browser tabs, rapid
+        # polling, etc.) would launch its own pair of subprocesses that
+        # all fight over the same file, piling up. This lock makes
+        # concurrent callers wait for one in-flight computation instead
+        # of starting their own; the short TTL cache means callers that
+        # arrive moments apart get the same recent answer for free.
+        self.probe_lock = threading.Lock()
+        self.probe_cache = None  # (monotonic_time, (raw_wallets, balances, job_status))
+        self.probe_cache_ttl = 2.0
+        self.probe_refreshing = False
+
+    def smooth_frontier(self, job_status):
+        """Clamp a freshly-read job_status's LOCAL_FRONTIER to never
+        report below the highest value seen so far this run."""
+        raw = job_status.get("LOCAL_FRONTIER")
+        if raw is None:
+            return job_status
+        try:
+            value = int(raw)
+        except ValueError:
+            return job_status
+        with self.lock:
+            if value < self.frontier_floor:
+                value = self.frontier_floor
+            else:
+                self.frontier_floor = value
+        return {**job_status, "LOCAL_FRONTIER": str(value)}
 
     @property
     def wallets(self):
@@ -258,6 +350,113 @@ class AppState:
         public address lookups) -- deliberately does not require unlock."""
         return dict(os.environ)
 
+    # -- wallet/balance probing (locked + cached; see probe_lock) -------
+
+    def _compute_raw_wallets_info(self):
+        """The expensive part: shells out to primechain-client for
+        balances/job-status and reads every named wallet's address.
+        Never call directly -- go through get_wallets_info(), which
+        holds probe_lock around this so concurrent callers share one
+        computation instead of racing their own subprocesses."""
+        balances, job_status, raw = [], {}, []
+        if not self.workdir_initialized():
+            return raw, balances, job_status
+
+        env = self.env_without_passphrase()
+        rc, out = run_binary(self.bin_dir / "primechain-client", ["balances", str(self.workdir)], env)
+        if rc == 0:
+            balances = parse_balances(out)
+        rc2, out2 = run_binary(self.bin_dir / "primechain-client", ["job-status", str(self.workdir)], env)
+        if rc2 == 0:
+            job_status = self.smooth_frontier(parse_job_status(out2))
+
+        registry = self.wallets
+        active = registry.active_names()
+        balance_by_addr = {w["address"]: w["total_micro_units"] for w in balances}
+        for name in registry.list_names():
+            try:
+                addr = registry.address_of(name, self.bin_dir, env)
+            except CliError:
+                addr = None
+            raw.append(
+                {
+                    "name": name,
+                    "address": addr,
+                    "total_micro_units": balance_by_addr.get(addr, 0),
+                    "active_roles": [r for r, n in active.items() if n == name],
+                }
+            )
+        return raw, balances, job_status
+
+    def _refresh_probe_cache_now(self):
+        """Does the actual expensive work and stores the result. Called
+        either inline (nothing cached yet -- this one caller has no
+        choice but to wait) or from a background thread (stale-while-
+        revalidate -- everyone else keeps getting the old answer,
+        instantly, until this finishes)."""
+        result = self._compute_raw_wallets_info()
+        with self.probe_lock:
+            self.probe_cache = (time.monotonic(), result)
+            self.probe_refreshing = False
+
+    def get_wallets_info(self, include_inert):
+        """Returns (wallets_info, balances, job_status). `include_inert`
+        controls only cheap post-hoc filtering (hiding empty, unused
+        default-prime/default-composite leftovers) -- it never affects
+        whether the underlying probe runs or is cached, so the filtered
+        and unfiltered callers (/api/state vs. the Manage tab) always
+        share the same cache entry instead of doubling the work.
+
+        Stale-while-revalidate: once anything is cached, every call
+        returns immediately using it -- even if it's past its TTL -- and
+        a background thread quietly refreshes it. A request only ever
+        blocks on the underlying primechain-client calls the very first
+        time, before there's anything to fall back on. This is what
+        keeps the UI responsive against a large chain.dat on slow
+        storage instead of re-blocking on every poll forever."""
+        have_cache = False
+        start_background_refresh = False
+        with self.probe_lock:
+            have_cache = self.probe_cache is not None
+            if have_cache:
+                is_stale = time.monotonic() - self.probe_cache[0] > self.probe_cache_ttl
+                if is_stale and not self.probe_refreshing:
+                    self.probe_refreshing = True
+                    start_background_refresh = True
+
+        if not have_cache:
+            self._refresh_probe_cache_now()  # nothing to show yet -- have to wait
+        elif start_background_refresh:
+            threading.Thread(target=self._refresh_probe_cache_now, daemon=True).start()
+
+        with self.probe_lock:
+            cache = self.probe_cache
+        # defensive: another thread could have invalidated the cache in
+        # the instant between the check above and this read -- narrow,
+        # but don't let that crash the request, just fall back to empty
+        raw, balances, job_status = cache[1] if cache is not None else ([], [], {})
+
+        if include_inert:
+            wallets_info = list(raw)
+        else:
+            wallets_info = [
+                w
+                for w in raw
+                if not (
+                    w["name"] in ("default-prime", "default-composite")
+                    and w["total_micro_units"] == 0
+                    and not w["active_roles"]
+                )
+            ]
+        return wallets_info, balances, job_status
+
+    def invalidate_probe_cache(self):
+        """Call after any wallet-mutating action (create/import/delete/
+        activate/rekey) so the next /api/state reflects it immediately
+        instead of waiting out the TTL."""
+        with self.probe_lock:
+            self.probe_cache = None
+
     # -- mining lifecycle ----------------------------------------------
 
     def is_mining_running(self):
@@ -303,18 +502,36 @@ class AppState:
         with self.lock:
             proc = self.mining_process
         if proc is not None and proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
+            _terminate_process_tree(proc)
 
     def _run_mining_sequence(self, env, bin_dir, workdir, target):
+        # fresh sync attempt -- don't let a stale floor from a previous
+        # run suppress this run's early, legitimately-low readings
+        with self.lock:
+            self.frontier_floor = 0
+
+        def _sync_progress_line():
+            # sync-peer prints nothing at all while it works -- a fresh
+            # sync from genesis can sit silent for minutes even though
+            # it's actively downloading records. Probe job-status
+            # ourselves so the log shows real, moving progress instead
+            # of looking stuck. Goes through get_wallets_info() (same
+            # lock + stale-while-revalidate cache as /api/state) rather
+            # than its own direct call -- otherwise this 4-second timer
+            # and a browser's state poll could each launch their own
+            # job-status against the same chain.dat at once.
+            _, _, job_status = self.get_wallets_info(include_inert=True)
+            frontier = job_status.get("LOCAL_FRONTIER")
+            return f"[syncing] local frontier: {frontier}" if frontier is not None else None
+
         try:
             self._append_log("$ sync-peer")
             self._run_streaming(
-                env, bin_dir, ["sync-peer", str(workdir)], timeout=SYNC_TIMEOUT_SECONDS
+                env,
+                bin_dir,
+                ["sync-peer", str(workdir)],
+                timeout=SYNC_TIMEOUT_SECONDS,
+                heartbeat=_sync_progress_line,
             )
             self._append_log(f"$ add-mine-job --target {target}")
             self._run_streaming(
@@ -337,11 +554,17 @@ class AppState:
             with self.lock:
                 self.mining_failed = True
 
-    def _run_streaming(self, env, bin_dir, args, timeout):
+    def _run_streaming(self, env, bin_dir, args, timeout, heartbeat=None, heartbeat_seconds=4):
         """Run a primechain-client subcommand, appending output to the log
         line-by-line as it's produced. Raises CliError if the process can't
         start, exits non-zero, or exceeds `timeout` seconds (None = no
-        timeout; used for run-jobs, which is meant to run until stopped)."""
+        timeout; used for run-jobs, which is meant to run until stopped).
+
+        `heartbeat`, if given, is called every `heartbeat_seconds` while
+        the subprocess is alive; its return value (a string, or None to
+        skip) is appended to the log. Used where the subprocess itself
+        stays silent for long stretches (sync-peer) so the log shows real
+        progress instead of looking frozen."""
         cmd = [str(bin_dir / "primechain-client"), *args]
         try:
             proc = subprocess.Popen(
@@ -351,6 +574,7 @@ class AppState:
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
+                start_new_session=True,  # own process group -- see _terminate_process_tree
             )
         except OSError as exc:
             raise CliError(f"could not run {args[0]}: {exc}") from exc
@@ -363,10 +587,31 @@ class AppState:
         if timeout is not None:
             def _kill_on_timeout():
                 timed_out.set()
-                proc.kill()
+                _terminate_process_tree(proc)
 
             watchdog = threading.Timer(timeout, _kill_on_timeout)
             watchdog.start()
+
+        heartbeat_timer = None
+        if heartbeat is not None:
+            def _tick():
+                nonlocal heartbeat_timer
+                if proc.poll() is not None:
+                    return
+                try:
+                    line = heartbeat()
+                except Exception:  # noqa: BLE001 -- a broken probe must never kill the run
+                    line = None
+                if line:
+                    self._append_log(line)
+                if proc.poll() is None:
+                    heartbeat_timer = threading.Timer(heartbeat_seconds, _tick)
+                    heartbeat_timer.daemon = True
+                    heartbeat_timer.start()
+
+            heartbeat_timer = threading.Timer(heartbeat_seconds, _tick)
+            heartbeat_timer.daemon = True
+            heartbeat_timer.start()
 
         try:
             for line in proc.stdout:
@@ -375,6 +620,8 @@ class AppState:
             code = proc.wait()
             if watchdog is not None:
                 watchdog.cancel()
+            if heartbeat_timer is not None:
+                heartbeat_timer.cancel()
             with self.lock:
                 if self.mining_process is proc:
                     self.mining_process = None
@@ -383,6 +630,37 @@ class AppState:
             raise CliError(f"{args[0]} timed out after {timeout}s")
         if code != 0:
             raise CliError(f"{args[0]} exited with code {code}")
+
+
+def _terminate_process_tree(proc):
+    """Stop `proc` and everything it spawned. primechain-client sync-peer
+    launches its own worker (primechain-sync-download) as a child of the
+    primechain-client process, not of us -- terminating just the Popen
+    object we hold leaves that worker running as an orphan, still
+    writing to the workdir, invisible to "mining stopped" in the UI.
+    Started with start_new_session=True so its whole process group can
+    be signaled at once instead."""
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def run_binary(binary, args, env, timeout=DEFAULT_CLI_TIMEOUT_SECONDS):
@@ -467,6 +745,13 @@ def find_default_bin_dir():
         here.parent / "primechain" / "build",
         here.parent / "primechain3" / "build",
         here.parent / "primechain2" / "build",
+        # primechain-pr is an active development fork, rebuilt often --
+        # rebuilding it while it's the binaries a live run-jobs/sync-peer
+        # process is executing from can hit "Text file busy". It has
+        # useful not-yet-upstreamed fixes (e.g. rekey), so it's still a
+        # candidate, just last: point --bin-dir at it explicitly if you
+        # want it as the default instead.
+        here.parent / "primechain-pr" / "build",
     ]
     for candidate in candidates:
         if (candidate / "primechain-client").is_file():
@@ -543,6 +828,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._guarded(self._handle_state)
         if path == "/api/log":
             return self._guarded(self._handle_log)
+        if path == "/api/wallets/export":
+            return self._guarded(self._handle_wallet_export)
+        if path == "/api/wallets/list_all":
+            return self._guarded(self._handle_wallet_list_all)
         self.send_error(404)
 
     def do_POST(self):
@@ -552,7 +841,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/api/unlock": self._handle_unlock,
             "/api/lock": self._handle_lock,
             "/api/wallets/create": self._handle_wallet_create,
+            "/api/wallets/import": self._handle_wallet_import,
             "/api/wallets/activate": self._handle_wallet_activate,
+            "/api/wallets/delete": self._handle_wallet_delete,
+            "/api/wallets/rekey": self._handle_wallet_rekey,
             "/api/mining/start": self._handle_mining_start,
             "/api/mining/stop": self._handle_mining_stop,
             "/api/send": self._handle_send,
@@ -565,38 +857,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _handle_state(self):
         cfg = state.snapshot_config()
-        balances, job_status = [], {}
-        wallets_info = []
-        if state.workdir_initialized():
-            env = state.env_without_passphrase()
-            rc, out = run_binary(state.bin_dir / "primechain-client", ["balances", str(state.workdir)], env)
-            if rc == 0:
-                balances = parse_balances(out)
-            rc2, out2 = run_binary(state.bin_dir / "primechain-client", ["job-status", str(state.workdir)], env)
-            if rc2 == 0:
-                job_status = parse_job_status(out2)
-
-            registry = state.wallets
-            active = registry.active_names()
-            balance_by_addr = {w["address"]: w["total_micro_units"] for w in balances}
-            for name in registry.list_names():
-                try:
-                    addr = registry.address_of(name, state.bin_dir, env)
-                except CliError:
-                    addr = None
-                wallets_info.append(
-                    {
-                        "name": name,
-                        "address": addr,
-                        "total_micro_units": balance_by_addr.get(addr, 0),
-                        "active_roles": [r for r, n in active.items() if n == name],
-                    }
-                )
-
+        wallets_info, balances, job_status = state.get_wallets_info(include_inert=False)
         self._send_json(
             {
                 "config": cfg,
                 "workdir_initialized": state.workdir_initialized(),
+                "has_any_wallet": state.wallets.has_any_wallet(),
                 "wallets": wallets_info,
                 "balances": balances,
                 "job_status": job_status,
@@ -604,6 +870,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "mining_failed": state.mining_failed,
             }
         )
+
+    def _handle_wallet_list_all(self):
+        wallets_info, _, _ = state.get_wallets_info(include_inert=True)
+        self._send_json({"wallets": wallets_info})
 
     def _handle_log(self):
         qs = parse_qs(urlsplit(self.path).query)
@@ -633,6 +903,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
         state.lock_passphrase()
         self._send_json({"unlocked": False})
 
+    @staticmethod
+    def _auto_assign_roles(registry, name, activate_as, first_ever):
+        """Shared by create and import: decide which mining role(s) a
+        newly-added wallet should take over, if any."""
+        if activate_as:
+            registry.set_active(activate_as, name)
+        elif first_ever:
+            # this call is what triggered workdir initialization -- any
+            # default wallet init-workdir created as a side effect
+            # belongs to no one; the wallet the user just named/imported
+            # is the real first identity, so it takes both roles
+            registry.set_active("prime", name)
+            registry.set_active("composite", name)
+        else:
+            # not the first wallet, but a role might still be unset
+            # (e.g. nothing has ever been activated for it): auto-fill
+            # so mining/send have something to use without an extra click
+            active = registry.active_names()
+            for role in ("prime", "composite"):
+                if not active.get(role):
+                    registry.set_active(role, name)
+
     def _handle_wallet_create(self):
         env = state.require_unlocked()
         # capture this *before* ensure_workdir, which -- on a brand new
@@ -650,26 +942,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise CliError("wallet name is required")
         registry = state.wallets
         address = registry.create(name, state.bin_dir, env)
+        self._auto_assign_roles(registry, name, body.get("activate_as"), first_ever)
+        state.invalidate_probe_cache()
+        self._send_json({"name": name, "address": address})
 
-        activate_as = body.get("activate_as")
-        if activate_as:
-            registry.set_active(activate_as, name)
-        elif first_ever:
-            # this call is what triggered workdir initialization -- any
-            # default wallet init-workdir created as a side effect
-            # belongs to no one; the wallet the user just named is the
-            # real first identity, so it takes both roles
-            registry.set_active("prime", name)
-            registry.set_active("composite", name)
-        else:
-            # not the first wallet, but a role might still be unset
-            # (e.g. nothing has ever been activated for it): auto-fill
-            # so mining/send have something to use without an extra click
-            active = registry.active_names()
-            for role in ("prime", "composite"):
-                if not active.get(role):
-                    registry.set_active(role, name)
-
+    def _handle_wallet_import(self):
+        env = state.require_unlocked()
+        first_ever = not state.workdir_initialized()
+        state.ensure_workdir(env)
+        body = self._read_json_body()
+        name = (body.get("name") or "").strip()
+        if not name:
+            raise CliError("wallet name is required")
+        raw_b64 = body.get("wallet_file_b64") or ""
+        try:
+            data = base64.b64decode(raw_b64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise CliError(f"could not decode uploaded wallet file: {exc}") from exc
+        registry = state.wallets
+        address = registry.import_wallet(name, data, state.bin_dir, env)
+        self._auto_assign_roles(registry, name, body.get("activate_as"), first_ever)
+        state.invalidate_probe_cache()
         self._send_json({"name": name, "address": address})
 
     def _handle_wallet_activate(self):
@@ -682,7 +975,89 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if role in ("prime", "composite") and state.is_mining_running():
             raise CliError("stop mining before switching the active wallet")
         state.wallets.set_active(role, name)
+        state.invalidate_probe_cache()
         self._send_json({"activated": {role: name}})
+
+    def _handle_wallet_delete(self):
+        # Deliberately no require_unlocked() -- deletion doesn't decrypt
+        # anything, and it's exactly the escape hatch someone locked out
+        # of a wallet (or cleaning up a leftover default-* one) needs.
+        # The confirm_name field is the real safety gate here.
+        body = self._read_json_body()
+        name = (body.get("name") or "").strip()
+        confirm = (body.get("confirm_name") or "").strip()
+        if not name:
+            raise CliError("wallet name is required")
+        if confirm != name:
+            raise CliError("confirmation name doesn't match")
+        state.wallets.delete(name)
+        state.invalidate_probe_cache()
+        self._send_json({"deleted": name})
+
+    def _handle_wallet_rekey(self):
+        # Every wallet primewallet creates/imports gets encrypted under
+        # the single passphrase this session unlocked with -- there's no
+        # per-wallet passphrase tracking. So "change passphrase" rekeys
+        # every wallet that currently opens under the active passphrase,
+        # in one pass, and moves the session onto the new one. A wallet
+        # that was imported under a *different* original passphrase
+        # simply won't match here and is reported as failed, untouched --
+        # it keeps its own passphrase, unlock with it again to reach it.
+        env = state.require_unlocked()
+        body = self._read_json_body()
+        new_passphrase = body.get("new_passphrase") or ""
+        if len(new_passphrase) < 4:
+            raise CliError("choose a passphrase at least 4 characters long")
+
+        registry = state.wallets
+        names = registry.list_names()
+        if not names:
+            raise CliError("no wallets to rekey")
+
+        rekey_env = dict(env)
+        rekey_env["PRIMECHAIN_WALLET_NEW_PASSPHRASE"] = new_passphrase
+        succeeded, failed = [], []
+        for name in names:
+            path = registry.named_wallet_path(name)
+            rc, out = run_binary(state.bin_dir / "primechain-wallet", ["rekey", str(path)], rekey_env)
+            if rc == 0:
+                succeeded.append(name)
+            else:
+                failed.append({"name": name, "error": out.strip()})
+
+        if succeeded:
+            with state.lock:
+                state.passphrase = new_passphrase
+            # canonical prime.wallet/composite.wallet are byte copies of
+            # whichever named wallet is active -- refresh any that just
+            # got rekeyed so the copy matches the new ciphertext too.
+            active = registry.active_names()
+            for role, name in active.items():
+                if name in succeeded:
+                    registry.set_active(role, name)
+
+        self._send_json({"succeeded": succeeded, "failed": failed})
+
+    def _handle_wallet_export(self):
+        # Reading a wallet's raw bytes doesn't need the passphrase (the
+        # signing key inside stays encrypted either way) -- required
+        # anyway so export sits behind the same access gate as every
+        # other wallet-touching action.
+        state.require_unlocked()
+        qs = parse_qs(urlsplit(self.path).query)
+        name = (qs.get("name", [""])[0]).strip()
+        if not name:
+            raise CliError("wallet name is required")
+        path = state.wallets.named_wallet_path(name)
+        if not path.exists():
+            raise CliError(f"no wallet named '{name}'")
+        data = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Disposition", f'attachment; filename="{name}.wallet"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def _handle_mining_start(self):
         state.start_mining()

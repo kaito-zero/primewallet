@@ -17,26 +17,68 @@
     </div>
   </header>
 
-  <section id="settings-panel" class="panel hidden">
-    <div class="panel-row">
-      <label>workdir <input id="cfg-workdir" type="text"></label>
+  <div id="global-mining-banner" class="global-mining-banner hidden">
+    <span class="dot running"></span>
+    <span id="global-mining-text">Mining is running</span>
+    <button id="global-mining-stop-btn" class="secondary-btn" type="button">Stop</button>
+  </div>
+
+  <div id="settings-modal" class="modal-overlay hidden">
+    <div class="modal">
+      <div class="modal-header"><h2>Settings</h2><button id="close-settings-btn" class="icon-btn" type="button">&#10005;</button></div>
+
+      <div class="tab-strip">
+        <button id="tab-btn-config" class="tab-btn active" type="button">Config</button>
+        <button id="tab-btn-wallets" class="tab-btn" type="button">Wallets</button>
+      </div>
+
+      <div id="tab-panel-config" class="tab-panel">
+        <div class="panel-row">
+          <label>workdir <input id="cfg-workdir" type="text"></label>
+        </div>
+        <div class="panel-row two-col">
+          <label>peer host <input id="cfg-peer-host" type="text"></label>
+          <label>peer port <input id="cfg-peer-port" type="number"></label>
+        </div>
+        <div class="panel-row">
+          <label>mine-job target <input id="cfg-target" type="text"></label>
+        </div>
+        <div class="panel-row">
+          <button id="save-config-btn" class="secondary-btn" type="button">save</button>
+          <span id="config-status" class="muted small"></span>
+        </div>
+        <p class="muted small">
+          bin dir: <code id="cfg-bin-dir">-</code><br>
+          Changing these while mining is running isn't allowed -- stop mining first.
+        </p>
+      </div>
+
+      <div id="tab-panel-wallets" class="tab-panel hidden">
+        <p class="muted small">
+          Wallets found in the current workdir. Deleting doesn't need the
+          passphrase -- but it's permanent, there's no undo and no backup
+          made. If the wallet was mining a role, that role is cleared and
+          needs a new wallet assigned before mining can start again.
+        </p>
+        <div id="manage-wallet-list"></div>
+
+        <div class="tab-divider"></div>
+
+        <h3 class="tab-subheading">Change passphrase</h3>
+        <p class="muted small">
+          Applies to every wallet in this workdir that currently opens
+          with your active passphrase. Must be unlocked first. A wallet
+          imported under a different passphrase won't match and is left
+          untouched -- unlock with its own passphrase to reach it.
+        </p>
+        <input id="rekey-new-passphrase" type="password" placeholder="New passphrase" autocomplete="new-password">
+        <input id="rekey-confirm-passphrase" type="password" placeholder="Confirm new passphrase" autocomplete="new-password">
+        <button id="rekey-submit-btn" class="primary-btn" type="button">Change passphrase</button>
+        <div id="rekey-error" class="err small"></div>
+        <div id="rekey-result" class="muted small"></div>
+      </div>
     </div>
-    <div class="panel-row two-col">
-      <label>peer host <input id="cfg-peer-host" type="text"></label>
-      <label>peer port <input id="cfg-peer-port" type="number"></label>
-    </div>
-    <div class="panel-row">
-      <label>mine-job target <input id="cfg-target" type="text"></label>
-    </div>
-    <div class="panel-row">
-      <button id="save-config-btn" class="secondary-btn" type="button">save</button>
-      <span id="config-status" class="muted small"></span>
-    </div>
-    <p class="muted small">
-      bin dir: <code id="cfg-bin-dir">-</code><br>
-      Changing these while mining is running isn't allowed -- stop mining first.
-    </p>
-  </section>
+  </div>
 
   <section id="unlock-screen" class="screen">
     <div class="hero-card">
@@ -46,6 +88,7 @@
       <input id="passphrase-input" type="password" placeholder="Passphrase" autocomplete="current-password">
       <button id="unlock-btn" class="primary-btn" type="button">Unlock</button>
       <div id="unlock-error" class="err small"></div>
+      <button id="forgot-passphrase-btn" class="link-btn full" type="button">Forgot your passphrase?</button>
       <p class="muted tiny">
         Kept in memory only, for as long as this window is running. Never
         written to disk, never sent anywhere except to the primechain
@@ -57,11 +100,20 @@
   <section id="onboarding-screen" class="screen hidden">
     <div class="hero-card">
       <div class="hero-icon">+</div>
-      <h1>Create your first wallet</h1>
+      <h1>Set up your wallet</h1>
       <p class="muted">This becomes your mining identity -- it can hold both the prime and composite roles, or you can add more wallets later and split them.</p>
+      <input id="onboard-passphrase" type="password" placeholder="Choose a passphrase" autocomplete="new-password">
       <input id="onboard-wallet-name" type="text" placeholder="Wallet name, e.g. main">
-      <button id="onboard-create-btn" class="primary-btn" type="button">Create wallet</button>
+      <button id="onboard-create-btn" class="primary-btn" type="button">Create new wallet</button>
+      <button id="onboard-import-btn" class="secondary-btn" type="button">Import from wallet file</button>
+      <input id="onboard-import-file" type="file" accept=".wallet" class="hidden">
       <div id="onboard-error" class="err small"></div>
+      <p class="muted tiny">
+        The passphrase encrypts this wallet's signing key. Kept in memory
+        only, for as long as this window is running -- never written to
+        disk, never sent anywhere except to the primechain binaries
+        themselves.
+      </p>
     </div>
   </section>
 
@@ -99,6 +151,7 @@
       <div class="action-row">
         <button id="open-send-btn" class="secondary-btn" type="button">Send</button>
         <button id="open-receive-btn" class="secondary-btn" type="button">Receive</button>
+        <button id="export-wallet-btn" class="secondary-btn" type="button">Export</button>
       </div>
     </div>
 
@@ -109,7 +162,7 @@
       </div>
       <button id="mining-toggle-btn" class="primary-btn small" type="button">Start mining</button>
     </div>
-    <div id="job-status" class="muted tiny job-status"></div>
+    <div id="job-status" class="job-status muted tiny"></div>
 
     <button id="activity-toggle" class="link-btn full" type="button">Activity &#9662;</button>
     <section id="activity-panel" class="activity-panel hidden">
@@ -144,10 +197,32 @@
 
   <div id="create-modal" class="modal-overlay hidden">
     <div class="modal">
-      <div class="modal-header"><h2>Create wallet</h2><button id="close-create-btn" class="icon-btn" type="button">&#10005;</button></div>
+      <div class="modal-header"><h2>Add a wallet</h2><button id="close-create-btn" class="icon-btn" type="button">&#10005;</button></div>
       <input id="create-wallet-name" type="text" placeholder="Wallet name">
-      <button id="create-submit-btn" class="primary-btn" type="button">Create</button>
+      <button id="create-submit-btn" class="primary-btn" type="button">Create new</button>
+      <button id="create-import-btn" class="secondary-btn" type="button">Import from wallet file</button>
+      <input id="create-import-file" type="file" accept=".wallet" class="hidden">
       <div id="create-error" class="err small"></div>
+    </div>
+  </div>
+
+  <div id="forgot-modal" class="modal-overlay hidden">
+    <div class="modal">
+      <div class="modal-header"><h2>Forgot your passphrase?</h2><button id="close-forgot-btn" class="icon-btn" type="button">&#10005;</button></div>
+      <p class="muted small">
+        There's no recovery for this. primechain wallets don't have a
+        seed phrase -- the passphrase directly encrypts the signing key,
+        and there's no separate backup secret that unlocks it another
+        way. If it's really gone, the wallet(s) at the current workdir
+        can't be opened again.
+      </p>
+      <p class="muted small">
+        What you can do: point this app at a different (or new) workdir
+        and set up a fresh wallet there. Nothing at the current workdir
+        gets touched or deleted -- it just sits on disk in case the
+        passphrase turns up later.
+      </p>
+      <button id="forgot-open-settings-btn" class="primary-btn" type="button">Open workdir settings</button>
     </div>
   </div>
 
@@ -157,4 +232,3 @@
 <script src="/app.js"></script>
 </body>
 </html>
-</content>

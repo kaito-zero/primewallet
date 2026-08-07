@@ -8,9 +8,11 @@ It's a thin UI over the existing `primechain-client` / `primechain-wallet` / `pr
 
 - Set up a workdir and bootstrap peer from the browser -- no config file editing.
 - Unlock with a wallet passphrase, held in the server process's memory only, never written to disk or logged.
-- Create any number of named wallets. Each one can independently hold the prime-mining role, the composite-mining role, both, or neither -- switch which wallet does what per role, per wallet, from its own account card, the same way you'd switch accounts in a browser wallet.
-- Start/stop mining (`sync-peer` -> `add-mine-job` -> `run-jobs`) with live streaming output.
+- Create any number of named wallets, or import one from a backup `.wallet` file. Each one can independently hold the prime-mining role, the composite-mining role, both, or neither -- switch which wallet does what per role, per wallet, from its own account card, the same way you'd switch accounts in a browser wallet.
+- Start/stop mining (`sync-peer` -> `add-mine-job` -> `run-jobs`) with live streaming output; a persistent banner shows mining status on every screen, since a mining process can outlive a wallet's own bookkeeping.
 - Check balances and send transactions between wallets.
+- Export a wallet to a `.wallet` file, or change the passphrase for every wallet in the workdir that currently opens with it, from Settings.
+- Manage tab lists every wallet in the workdir (including ones the account switcher hides because they're empty and unused) and lets you delete any of them -- doesn't require being unlocked, since deleting a wallet you're locked out of is exactly the point.
 
 ## Requirements
 
@@ -34,11 +36,13 @@ python3 server.py
 
 Then open `http://127.0.0.1:8765/`. Workdir, peer, and passphrase are all set from the browser on first run.
 
-If the binaries aren't found automatically (checked next to this checkout, under `../primechain/build`, and under `./build`), point at them directly:
+If the binaries aren't found automatically (checked, in order, under `../primechain-pr/build`, `../primechain/build`, `../primechain3/build`, `../primechain2/build`, and `./build`), point at them directly:
 
 ```bash
 python3 server.py --bin-dir /path/to/primechain/build
 ```
+
+Change-passphrase needs a `primechain-wallet` with the `rekey` subcommand, which isn't in upstream primechain yet ([PR pending](https://github.com/midlincoln/primechain/pulls)) -- everything else works against a plain upstream build.
 
 `--workdir`, `--peer-host`, `--peer-port`, `--target`, and `--listen-port` are also available; see `--help`.
 
@@ -56,4 +60,3 @@ static/index.html  markup
 static/app.js       UI logic, polls /api/state and /api/log
 static/style.css    styling
 ```
-</content>

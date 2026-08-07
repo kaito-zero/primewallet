@@ -79,26 +79,41 @@ code {
 .icon-btn:disabled { opacity: 0.4; cursor: default; }
 .icon-btn:hover:not(:disabled) { border-color: var(--accent); }
 
-/* -- panel (settings) -- */
+/* -- settings modal: tabs + form rows -- */
 
-.panel {
-  background: var(--card-bg);
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  padding: 1rem;
-  margin-bottom: 1rem;
-  box-shadow: var(--shadow);
-}
 .panel-row { margin-bottom: 0.6rem; }
 .panel-row.two-col { display: flex; gap: 0.75rem; }
 .panel-row.two-col label { flex: 1; }
-.panel label {
+#tab-panel-config label, #tab-panel-wallets label {
   display: flex;
   flex-direction: column;
   gap: 0.3rem;
   font-size: 0.8rem;
   color: var(--muted);
 }
+
+.tab-strip {
+  display: flex;
+  gap: 0.3rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 1rem;
+}
+.tab-btn {
+  border: none;
+  background: none;
+  color: var(--muted);
+  padding: 0.5rem 0.2rem;
+  margin-right: 0.75rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+.tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+.tab-panel { display: flex; flex-direction: column; gap: 0.6rem; }
+.tab-divider { height: 1px; background: var(--border); margin: 1rem 0; }
+.tab-subheading { margin: 0; font-size: 0.95rem; }
 
 /* -- shared inputs/buttons -- */
 
@@ -181,6 +196,25 @@ input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1p
 }
 .hero-card h1 { margin: 0; font-size: 1.3rem; }
 .hero-card p { margin: 0; }
+
+/* -- global mining banner: visible on every screen whenever mining is
+   running, regardless of wallet/lock state, since a mining process can
+   outlive the named-wallet bookkeeping (it reads canonical wallet files,
+   not the named ones) -- there must always be a way to see/stop it. */
+
+.global-mining-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  background: var(--card-bg);
+  border: 1px solid var(--ok);
+  border-radius: 12px;
+  padding: 0.6rem 0.8rem;
+  margin-bottom: 1rem;
+  font-size: 0.85rem;
+}
+.global-mining-banner .secondary-btn { flex: none; padding: 0.35rem 0.8rem; font-size: 0.8rem; }
+#global-mining-text { flex: 1; }
 
 /* -- account switcher -- */
 
@@ -317,6 +351,13 @@ input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1p
   border-color: var(--ok);
   background: light-dark(rgba(21, 128, 61, 0.08), rgba(74, 222, 128, 0.12));
 }
+/* assigned to mine this role, but mining isn't running -- deliberately
+   NOT green, so it can't be mistaken for "currently mining" */
+.role-toggle.assigned {
+  color: var(--text);
+  border-color: var(--accent);
+  background: light-dark(rgba(109, 40, 217, 0.06), rgba(167, 139, 250, 0.1));
+}
 .role-dot {
   width: 0.55rem;
   height: 0.55rem;
@@ -324,6 +365,7 @@ input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1p
   background: var(--border);
 }
 .role-toggle.active .role-dot { background: var(--ok); }
+.role-toggle.assigned .role-dot { background: var(--accent); }
 
 .action-row { display: flex; gap: 0.6rem; }
 
@@ -352,6 +394,7 @@ input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1p
 .dot.failed { background: var(--err); }
 
 .job-status { margin-top: 0.5rem; text-align: center; }
+.job-status.active { color: var(--text); font-weight: 600; }
 
 /* -- activity / log -- */
 
@@ -420,6 +463,60 @@ input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1p
   word-break: break-all;
 }
 
+/* -- manage wallets -- */
+
+.manage-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.6rem 0.2rem;
+  border-bottom: 1px solid var(--border);
+}
+.manage-row:last-child { border-bottom: none; }
+.manage-row-info { flex: 1; min-width: 0; }
+.manage-row-name { font-weight: 600; font-size: 0.9rem; }
+.manage-row-address {
+  font-size: 0.75rem;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: block;
+}
+.manage-row-roles { display: flex; gap: 0.25rem; margin-top: 0.2rem; }
+.manage-delete-btn {
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--err);
+  border-radius: 10px;
+  padding: 0.4rem 0.7rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.manage-delete-btn:hover { border-color: var(--err); }
+.manage-confirm-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  flex: 1;
+}
+.manage-confirm-row input {
+  padding: 0.4rem 0.5rem;
+  font-size: 0.8rem;
+}
+.manage-confirm-actions { display: flex; gap: 0.4rem; }
+.manage-confirm-actions button {
+  flex: 1;
+  padding: 0.4rem;
+  font-size: 0.8rem;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.manage-confirm-cancel { border: 1px solid var(--border); background: none; color: var(--text); }
+.manage-confirm-delete { border: 1px solid var(--err); background: var(--err); color: #fff; }
+.manage-confirm-delete:disabled { opacity: 0.5; cursor: default; }
+
 /* -- toast -- */
 
 .toast {
@@ -437,4 +534,3 @@ input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1p
   max-width: 90vw;
 }
 .toast.err { background: var(--err); color: #fff; }
-</content>
