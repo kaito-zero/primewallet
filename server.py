@@ -58,6 +58,30 @@ WALLET_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024
 
 
+def str_field(value, default=""):
+    """Coerce a JSON request-body value to a string, safely, before
+    it's used anywhere a string is assumed -- wallet-name regex
+    matching, .strip(), len(), or (worst case) a subprocess env var/
+    argument, which requires an actual str and raises TypeError deep
+    inside a library call otherwise. A client sending the wrong JSON
+    type for a field that's supposed to be a string (a number, a list,
+    a bool -- confirmed live: {"name": 123} crashed wallet creation
+    with an unhandled AttributeError instead of a clean 400) is
+    exactly the kind of malformed-but-not-malicious input a local tool
+    should still handle gracefully. None passes through as `default`
+    (preserving "field omitted" as a distinct case from "field sent as
+    an empty/wrong-typed value"); anything else that isn't already a
+    str goes through str(), which never raises -- an int becomes its
+    digit string, a list becomes its repr, both of which then simply
+    fail whatever validation applies (wallet-name regex, etc.) instead
+    of crashing before validation ever runs."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
 class CliError(Exception):
     """Raised when a primechain-client/-wallet/-send invocation fails,
     can't be started, or times out. Always safe to show to the user --
@@ -1153,8 +1177,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _read_json_body(self):
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        if length == 0:
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError as exc:
+            raise CliError("invalid Content-Length header") from exc
+        if length <= 0:
+            # Not just `== 0`: a *negative* Content-Length would sail
+            # past that check and reach self.rfile.read(length) below --
+            # for a negative count, read() on a buffered stream reads
+            # until EOF, which on a socket means it blocks waiting for
+            # the client to close the connection. Confirmed no hang in
+            # practice (the client side rejected sending it), but
+            # nothing here should depend on that -- reject explicitly.
             return {}
         if length > MAX_REQUEST_BODY_BYTES:
             raise CliError(f"request body too large ({length} bytes, max {MAX_REQUEST_BODY_BYTES})")
@@ -1248,9 +1282,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _handle_config(self):
         body = self._read_json_body()
+        # workdir/peer_host end up in Path()/subprocess args+env, both
+        # of which require an actual str and raise TypeError on
+        # anything else -- coerce before update_config ever sees them.
+        # peer_port and target already handle any type safely
+        # themselves (int()/str() inside update_config).
         state.update_config(
-            workdir=body.get("workdir"),
-            peer_host=body.get("peer_host"),
+            workdir=str_field(body.get("workdir"), None),
+            peer_host=str_field(body.get("peer_host"), None),
             peer_port=body.get("peer_port"),
             target=body.get("target"),
         )
@@ -1258,7 +1297,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _handle_unlock(self):
         body = self._read_json_body()
-        state.unlock(body.get("passphrase", ""))
+        # A non-string passphrase (a stray int, say) would pass unlock()'s
+        # truthy check, get stored, and only blow up later as a
+        # subprocess env TypeError the next time anything actually
+        # tries to use it -- coerce here instead, at the one point that
+        # decides what's actually stored.
+        state.unlock(str_field(body.get("passphrase"), ""))
         self._send_json({"unlocked": True})
 
     def _handle_lock(self):
@@ -1299,7 +1343,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         first_ever = not state.workdir_initialized()
         state.ensure_workdir(env)
         body = self._read_json_body()
-        name = (body.get("name") or "").strip()
+        name = str_field(body.get("name")).strip()
         if not name:
             raise CliError("wallet name is required")
         registry = state.wallets
@@ -1313,10 +1357,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         first_ever = not state.workdir_initialized()
         state.ensure_workdir(env)
         body = self._read_json_body()
-        name = (body.get("name") or "").strip()
+        name = str_field(body.get("name")).strip()
         if not name:
             raise CliError("wallet name is required")
-        raw_b64 = body.get("wallet_file_b64") or ""
+        raw_b64 = str_field(body.get("wallet_file_b64"))
         try:
             data = base64.b64decode(raw_b64, validate=True)
         except (binascii.Error, ValueError) as exc:
@@ -1330,8 +1374,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _handle_wallet_activate(self):
         env = state.require_unlocked()
         body = self._read_json_body()
-        role = body.get("role")
-        name = body.get("name")
+        role = str_field(body.get("role"))
+        name = str_field(body.get("name"))
         if not role or not name:
             raise CliError("role and name are required")
         if role in ("prime", "composite") and state.is_mining_running():
@@ -1346,8 +1390,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # of a wallet (or cleaning up a leftover default-* one) needs.
         # The confirm_name field is the real safety gate here.
         body = self._read_json_body()
-        name = (body.get("name") or "").strip()
-        confirm = (body.get("confirm_name") or "").strip()
+        name = str_field(body.get("name")).strip()
+        confirm = str_field(body.get("confirm_name")).strip()
         if not name:
             raise CliError("wallet name is required")
         if confirm != name:
@@ -1367,7 +1411,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # it keeps its own passphrase, unlock with it again to reach it.
         env = state.require_unlocked()
         body = self._read_json_body()
-        new_passphrase = body.get("new_passphrase") or ""
+        new_passphrase = str_field(body.get("new_passphrase"))
         if len(new_passphrase) < 4:
             raise CliError("choose a passphrase at least 4 characters long")
 
@@ -1496,10 +1540,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         env = state.require_unlocked()
         body = self._read_json_body()
 
-        sender_name = (body.get("from") or "").strip()
+        sender_name = str_field(body.get("from")).strip()
         if not sender_name:
             raise CliError("'from' wallet name is required")
-        receiver = (body.get("receiver") or "").strip()
+        receiver = str_field(body.get("receiver")).strip()
         if not receiver:
             raise CliError("receiver address is required")
         try:
