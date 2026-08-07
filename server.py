@@ -1473,6 +1473,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise CliError("prime, amount, and fee must be integers") from exc
         if prime < 2 or amount <= 0 or fee < 0:
             raise CliError("prime must be >= 2, amount > 0, fee >= 0")
+        # primechain-send parses these with std::stoull, which throws an
+        # uncaught C++ exception (not a clean error) on anything bigger
+        # than a uint64_t -- confirmed live: it crashes the subprocess
+        # outright ("terminate called after throwing an instance of
+        # 'std::out_of_range'") instead of failing gracefully. Reject it
+        # here with a normal error instead of spawning a process
+        # guaranteed to crash.
+        UINT64_MAX = 2**64 - 1
+        if prime > UINT64_MAX or amount > UINT64_MAX or fee > UINT64_MAX:
+            raise CliError(f"prime, amount, and fee must each fit in 64 bits (max {UINT64_MAX})")
 
         registry = state.wallets
         wallet_path = registry.named_wallet_path(sender_name)
