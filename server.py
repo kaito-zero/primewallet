@@ -117,10 +117,35 @@ class WalletRegistry:
             return True
         return self.canonical_path("prime").exists() or self.canonical_path("composite").exists()
 
+    def _name_conflict_message(self, name):
+        """path.exists() already decided this name is taken -- but on a
+        case-insensitive filesystem (WSL2's DrvFs under /mnt/c, /mnt/d,
+        etc.) that can trigger for a name that was never actually used,
+        just because it differs only by capitalization from one that
+        was ('Kaitozero' colliding with an existing 'kaitozero'). "a
+        wallet named 'Kaitozero' already exists" is a confusing thing
+        to read when you've never created anything by that exact name
+        -- name the wallet it actually collides with instead, when
+        that's what happened. Never changes *whether* something is
+        rejected, only the message -- a case-sensitive filesystem never
+        reaches the "differs only by case" branch, since path.exists()
+        would already be False there for a genuinely distinct name.
+        """
+        lowered = name.lower()
+        for existing in self.list_names():
+            if existing == name:
+                break
+            if existing.lower() == lowered:
+                return (
+                    f"a wallet named '{existing}' already exists -- '{name}' only "
+                    "differs by capitalization, which this filesystem can't tell apart"
+                )
+        return f"a wallet named '{name}' already exists"
+
     def create(self, name, bin_dir, env):
         path = self.named_wallet_path(name)
         if path.exists():
-            raise CliError(f"a wallet named '{name}' already exists")
+            raise CliError(self._name_conflict_message(name))
         self.named_dir.mkdir(parents=True, exist_ok=True)
         rc, out = run_binary(bin_dir / "primechain-wallet", ["new-miner", str(path)], env)
         if rc != 0:
@@ -133,7 +158,7 @@ class WalletRegistry:
         garbage input is rejected rather than sitting there silently."""
         path = self.named_wallet_path(name)
         if path.exists():
-            raise CliError(f"a wallet named '{name}' already exists")
+            raise CliError(self._name_conflict_message(name))
         if not data:
             raise CliError("wallet file is empty")
         self.named_dir.mkdir(parents=True, exist_ok=True)
