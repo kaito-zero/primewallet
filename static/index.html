@@ -177,9 +177,10 @@
       <label>From <select id="send-from"></select></label>
       <label>To <input id="send-receiver" type="text" placeholder="pcpq1_..."></label>
       <div class="panel-row two-col">
-        <label>Prime asset # <input id="send-prime" type="number" min="2"></label>
+        <label>Prime asset # <select id="send-prime"></select></label>
         <label>Amount <input id="send-amount" type="number" min="1"></label>
       </div>
+      <div id="send-holding-hint" class="muted tiny"></div>
       <label>Fee <input id="send-fee" type="number" min="0" value="1"></label>
       <button id="send-submit-btn" class="primary-btn" type="button">Send</button>
       <div id="send-result" class="muted small"></div>

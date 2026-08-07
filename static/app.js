@@ -2,10 +2,30 @@
 
 let logCursor = 0;
 let lastState = null;
-let selectedWalletName = null; // which account card is showing -- UI-only, independent of mining roles
 let settingsTouched = false;
 let dropdownOpen = false;
 let toastTimer = null;
+
+// which account card is showing -- UI-only, independent of mining roles.
+// Persisted so a page reload (Ctrl+R) keeps whatever you last switched
+// to instead of falling back to "first wallet" every time.
+const SELECTED_WALLET_STORAGE_KEY = "primewallet:selected-wallet";
+let selectedWalletName = null;
+try {
+  selectedWalletName = localStorage.getItem(SELECTED_WALLET_STORAGE_KEY);
+} catch (_) {
+  // localStorage unavailable -- falls back to picking a wallet fresh each load
+}
+
+function setSelectedWallet(name) {
+  selectedWalletName = name;
+  try {
+    if (name) localStorage.setItem(SELECTED_WALLET_STORAGE_KEY, name);
+    else localStorage.removeItem(SELECTED_WALLET_STORAGE_KEY);
+  } catch (_) {
+    // ignore -- storage unavailable, in-memory value still works this session
+  }
+}
 
 // -- tiny helpers ----------------------------------------------------
 
@@ -117,7 +137,7 @@ function pickSelectedWallet(state) {
     (w) => w.active_roles.includes("prime") || w.active_roles.includes("composite")
   );
   const fallback = active || state.wallets[0];
-  selectedWalletName = fallback ? fallback.name : null;
+  setSelectedWallet(fallback ? fallback.name : null);
   return selectedWalletName;
 }
 
@@ -161,6 +181,7 @@ function renderAccountSwitcher(state, name) {
 function renderDropdown(state) {
   const dd = el("account-dropdown");
   dd.innerHTML = "";
+  const running = state.mining_running;
   for (const w of state.wallets) {
     const item = document.createElement("button");
     item.type = "button";
@@ -173,17 +194,22 @@ function renderDropdown(state) {
     label.textContent = w.name;
     const roles = document.createElement("span");
     roles.className = "roles-mini";
-    for (const role of ["prime", "composite"]) {
-      const dot = document.createElement("span");
-      dot.className = "role-mini-dot" + (w.active_roles.includes(role) ? " on" : "");
-      dot.title = `${role}${w.active_roles.includes(role) ? " (active)" : ""}`;
-      roles.appendChild(dot);
+    // One signal for "lit up" everywhere in the app: actually mining
+    // that role right now, not just assigned to it. Only the wallet(s)
+    // that both hold a role and are actually mining get a tag.
+    for (const [role, letter] of [["prime", "P"], ["composite", "C"]]) {
+      if (!w.active_roles.includes(role) || !running) continue;
+      const badge = document.createElement("span");
+      badge.className = "role-mini-badge on";
+      badge.textContent = letter;
+      badge.title = `${role} (active)`;
+      roles.appendChild(badge);
     }
     item.appendChild(av);
     item.appendChild(label);
     item.appendChild(roles);
     item.addEventListener("click", () => {
-      selectedWalletName = w.name;
+      setSelectedWallet(w.name);
       closeDropdown();
       renderAll(lastState);
     });
@@ -239,13 +265,12 @@ function renderAccountCard(state, name) {
 
   for (const [btn, role] of [[primeBtn, "prime"], [compositeBtn, "composite"]]) {
     const isAssigned = wallet.active_roles.includes(role);
-    // "assigned" (this wallet is designated for the role) and "actually
-    // mining right now" (the global run-jobs process is up) are
-    // different things -- a wallet can be assigned while mining is
-    // stopped. Green/active only when both are true, so the button
-    // doesn't look like it's mining when nothing is running.
+    // Colored/active only while actually mining that role right now --
+    // which wallet is *assigned* to a role (independent of whether
+    // mining is running) shows up on the account switcher's P/C badges
+    // instead, so the button itself doesn't need a separate, easy-to-
+    // confuse-with-"live" resting color.
     btn.classList.toggle("active", isAssigned && running);
-    btn.classList.toggle("assigned", isAssigned && !running);
     btn.disabled = running; // switching the active wallet mid-run isn't allowed server-side
     if (running) {
       btn.title = isAssigned
@@ -265,23 +290,28 @@ function renderMiningBar(state) {
   const label = el("mining-label");
   const btn = el("mining-toggle-btn");
 
-  dot.className = "dot" + (running ? " running" : state.mining_failed ? " failed" : "");
-  if (running) {
+  // The Start/Stop button reflects the wallet you're *looking at*, not
+  // just whether mining is running somewhere. Mining is one global
+  // process, but showing "Stop mining" while viewing a wallet that
+  // isn't the one actually mining reads as if clicking it would stop
+  // that wallet -- when it wouldn't, since it isn't running.
+  const viewedWallet = findWallet(state, selectedWalletName);
+  const viewedWalletIsMining = running && !!viewedWallet && viewedWallet.active_roles.length > 0;
+  const minerWallet = running ? state.wallets.find((w) => w.active_roles.length > 0) : null;
+
+  dot.className = "dot" + (viewedWalletIsMining ? " running" : !running && state.mining_failed ? " failed" : "");
+  if (viewedWalletIsMining) {
     label.textContent = "Mining running";
+  } else if (running) {
+    label.textContent = minerWallet ? `Mining running with ${minerWallet.name}` : "Mining running";
   } else if (state.mining_failed) {
     label.textContent = "Mining stopped (last run failed)";
   } else {
     label.textContent = "Mining stopped";
   }
-  btn.textContent = running ? "Stop mining" : "Start mining";
-
-  const hasPair =
-    state.wallets.some((w) => w.active_roles.includes("prime")) &&
-    state.wallets.some((w) => w.active_roles.includes("composite"));
-  btn.disabled = !running && !hasPair;
-  btn.title = !running && !hasPair
-    ? "activate a wallet for both prime and composite mining first"
-    : "";
+  btn.textContent = viewedWalletIsMining ? "Stop mining" : "Start mining";
+  btn.disabled = false; // clicking always does something sensible now -- see onClick("mining-toggle-btn")
+  btn.title = "";
 
   const entries = Object.entries(state.job_status || {});
   el("job-status").textContent = entries.length
@@ -379,8 +409,54 @@ function openSendModal() {
   el("send-result").textContent = "";
   show("send-modal");
   if (selectedWalletName) el("send-from").value = selectedWalletName;
+  refreshSendHoldings();
 }
 function closeSendModal() { hide("send-modal"); }
+
+let sendHoldingsRequestId = 0;
+
+async function refreshSendHoldings() {
+  const name = el("send-from").value;
+  const select = el("send-prime");
+  const hint = el("send-holding-hint");
+  const requestId = ++sendHoldingsRequestId; // guards against an older, slower request overwriting a newer one
+  select.innerHTML = "";
+  hint.textContent = "loading holdings...";
+  if (!name) {
+    hint.textContent = "";
+    return;
+  }
+  let holdings = [];
+  try {
+    const data = await api(`/api/wallets/holdings?name=${encodeURIComponent(name)}`);
+    holdings = data.holdings || [];
+  } catch (err) {
+    if (requestId !== sendHoldingsRequestId) return;
+    hint.textContent = `could not load holdings: ${err.message}`;
+    return;
+  }
+  if (requestId !== sendHoldingsRequestId) return; // a newer request already landed
+
+  if (holdings.length === 0) {
+    hint.textContent = "this wallet has no assets to send yet";
+    return;
+  }
+  for (const h of holdings) {
+    const opt = document.createElement("option");
+    opt.value = h.prime;
+    opt.dataset.microUnits = h.micro_units;
+    opt.textContent = `${h.prime} (${h.micro_units} available)`;
+    select.appendChild(opt);
+  }
+  updateSendHoldingHint();
+}
+
+function updateSendHoldingHint() {
+  const select = el("send-prime");
+  const hint = el("send-holding-hint");
+  const opt = select.options[select.selectedIndex];
+  hint.textContent = opt ? `available: ${opt.dataset.microUnits}` : "";
+}
 
 function openReceiveModal() {
   const wallet = lastState && findWallet(lastState, selectedWalletName);
@@ -462,7 +538,7 @@ el("passphrase-input").addEventListener("keydown", (ev) => {
 
 onClick("lock-btn", async () => {
   await api("/api/lock", { method: "POST" });
-  selectedWalletName = null;
+  setSelectedWallet(null);
 });
 
 async function ensureUnlockedForSetup() {
@@ -488,7 +564,7 @@ onClick("onboard-create-btn", async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name }),
     });
-    selectedWalletName = result.name;
+    setSelectedWallet(result.name);
     el("onboard-passphrase").value = "";
   } catch (err) {
     el("onboard-error").textContent = err.message;
@@ -523,7 +599,7 @@ el("onboard-import-file").addEventListener("change", async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name, wallet_file_b64 }),
     });
-    selectedWalletName = result.name;
+    setSelectedWallet(result.name);
     el("onboard-passphrase").value = "";
   } catch (err) {
     el("onboard-error").textContent = err.message;
@@ -607,7 +683,7 @@ function renderManageList(wallets) {
           });
           deleteConfirmTarget = null;
           showToast(`Deleted "${w.name}"`);
-          if (selectedWalletName === w.name) selectedWalletName = null;
+          if (selectedWalletName === w.name) setSelectedWallet(null);
         } catch (err) {
           showToast(err.message, true);
           deleteBtn.disabled = false;
@@ -720,15 +796,56 @@ async function activateRole(role) {
 }
 
 onClick("mining-toggle-btn", async () => {
-  if (lastState && lastState.mining_running) {
+  const state = lastState;
+  if (!state) return;
+  const viewedWallet = findWallet(state, selectedWalletName);
+  if (!viewedWallet) throw new Error("no wallet selected");
+  const running = state.mining_running;
+  const viewedWalletIsMining = running && viewedWallet.active_roles.length > 0;
+
+  if (running && viewedWalletIsMining) {
     await api("/api/mining/stop", { method: "POST" });
-  } else {
-    await api("/api/mining/start", { method: "POST" });
-    // starting mining can be quiet for a while (fresh sync) -- open the
-    // log automatically so progress is visible without hunting for the toggle
-    show("activity-panel");
-    el("activity-toggle").textContent = "Activity ▴";
+    return;
   }
+
+  if (running && !viewedWalletIsMining) {
+    // mining is running, but with a *different* wallet than the one
+    // being viewed -- clicking "Start mining" here means "switch to
+    // this wallet instead", which needs stopping the current run first.
+    // Confirm rather than silently yanking mining away from whichever
+    // wallet the user thought was still going.
+    const minerWallet = state.wallets.find((w) => w.active_roles.length > 0);
+    const minerName = minerWallet ? minerWallet.name : "another wallet";
+    const proceed = window.confirm(
+      `${minerName} is currently mining. Stop it and start mining with ${viewedWallet.name} instead?`
+    );
+    if (!proceed) return;
+    await api("/api/mining/stop", { method: "POST" });
+  }
+
+  // Not running (or just stopped above to switch onto this wallet) --
+  // make sure the viewed wallet holds both roles before starting, so
+  // "Start mining" from any wallet's view is a one-click action instead
+  // of requiring the prime/composite toggles to be set up first.
+  if (!viewedWallet.active_roles.includes("prime")) {
+    await api("/api/wallets/activate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ role: "prime", name: viewedWallet.name }),
+    });
+  }
+  if (!viewedWallet.active_roles.includes("composite")) {
+    await api("/api/wallets/activate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ role: "composite", name: viewedWallet.name }),
+    });
+  }
+  await api("/api/mining/start", { method: "POST" });
+  // starting mining can be quiet for a while (fresh sync) -- open the
+  // log automatically so progress is visible without hunting for the toggle
+  show("activity-panel");
+  el("activity-toggle").textContent = "Activity ▴";
 });
 
 onClick("global-mining-stop-btn", async () => {
@@ -742,6 +859,8 @@ el("activity-toggle").addEventListener("click", () => {
 
 el("open-send-btn").addEventListener("click", openSendModal);
 el("close-send-btn").addEventListener("click", closeSendModal);
+el("send-from").addEventListener("change", refreshSendHoldings);
+el("send-prime").addEventListener("change", updateSendHoldingHint);
 el("open-receive-btn").addEventListener("click", openReceiveModal);
 el("close-receive-btn").addEventListener("click", closeReceiveModal);
 el("close-create-btn").addEventListener("click", closeCreateModal);
@@ -767,7 +886,7 @@ onClick("create-submit-btn", async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name }),
     });
-    selectedWalletName = result.name;
+    setSelectedWallet(result.name);
     closeCreateModal();
   } catch (err) {
     el("create-error").textContent = err.message;
@@ -795,7 +914,7 @@ el("create-import-file").addEventListener("change", async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name, wallet_file_b64 }),
     });
-    selectedWalletName = result.name;
+    setSelectedWallet(result.name);
     closeCreateModal();
   } catch (err) {
     el("create-error").textContent = err.message;

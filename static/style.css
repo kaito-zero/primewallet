@@ -285,13 +285,25 @@ input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1p
 .dropdown-sep { height: 1px; background: var(--border); margin: 0.4rem 0.2rem; }
 .dropdown-item.create-item { color: var(--accent); font-weight: 600; }
 
-.role-mini-dot {
-  width: 0.5rem;
-  height: 0.5rem;
+.role-mini-badge {
+  width: 1.1rem;
+  height: 1.1rem;
   border-radius: 50%;
-  background: var(--border);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.6rem;
+  font-weight: 700;
+  color: var(--muted);
+  background: transparent;
+  border: 1.5px solid var(--muted);
+  flex-shrink: 0;
 }
-.role-mini-dot.on { background: var(--ok); }
+.role-mini-badge.on {
+  color: light-dark(#fff, #032010);
+  background: var(--ok);
+  border-color: var(--ok);
+}
 
 /* -- account card -- */
 
@@ -351,13 +363,6 @@ input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1p
   border-color: var(--ok);
   background: light-dark(rgba(21, 128, 61, 0.08), rgba(74, 222, 128, 0.12));
 }
-/* assigned to mine this role, but mining isn't running -- deliberately
-   NOT green, so it can't be mistaken for "currently mining" */
-.role-toggle.assigned {
-  color: var(--text);
-  border-color: var(--accent);
-  background: light-dark(rgba(109, 40, 217, 0.06), rgba(167, 139, 250, 0.1));
-}
 .role-dot {
   width: 0.55rem;
   height: 0.55rem;
@@ -365,7 +370,6 @@ input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1p
   background: var(--border);
 }
 .role-toggle.active .role-dot { background: var(--ok); }
-.role-toggle.assigned .role-dot { background: var(--accent); }
 
 .action-row { display: flex; gap: 0.6rem; }
 

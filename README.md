@@ -36,7 +36,7 @@ python3 server.py
 
 Then open `http://127.0.0.1:8765/`. Workdir, peer, and passphrase are all set from the browser on first run.
 
-If the binaries aren't found automatically (checked, in order, under `../primechain-pr/build`, `../primechain/build`, `../primechain3/build`, `../primechain2/build`, and `./build`), point at them directly:
+If the binaries aren't found automatically (checked under `./build` and a `build/` folder next to a few sibling primechain checkouts -- see `find_default_bin_dir()` in `server.py` for the exact search order), point at them directly:
 
 ```bash
 python3 server.py --bin-dir /path/to/primechain/build
@@ -45,6 +45,36 @@ python3 server.py --bin-dir /path/to/primechain/build
 Change-passphrase needs a `primechain-wallet` with the `rekey` subcommand, which isn't in upstream primechain yet ([PR pending](https://github.com/midlincoln/primechain/pulls)) -- everything else works against a plain upstream build.
 
 `--workdir`, `--peer-host`, `--peer-port`, `--target`, and `--listen-port` are also available; see `--help`.
+
+## How mining runs
+
+Asked about explicitly by the primechain maintainer, since multi-wallet
+role switching can otherwise be mistaken for a protocol-level effect
+rather than a client one:
+
+- **One process, one proof store.** primewallet drives exactly one
+  `run-jobs` subprocess against exactly one workdir/proof store at a
+  time. There's no per-identity process fan-out and no shared proof
+  store across separate processes.
+- **One prime/composite pair, never several identities in parallel.**
+  At most one wallet is designated the prime miner and one the
+  composite miner (the same wallet can hold both). primewallet does
+  not run multiple mining identities concurrently to increase win
+  odds -- that's a deliberate scope decision, not a limitation we
+  didn't notice. If you want that, run the plain CLI's `run-jobs`
+  yourself against separate workdirs/identities; primewallet is a
+  normal single-identity wallet client, not a mining-optimization tool.
+- **Role reassignment is serialized with mining state.** The server
+  refuses to switch which wallet holds a role while `run-jobs` is
+  running (matching the CLI's own constraint) -- role changes only
+  take effect between runs, never mid-run. The UI's "Start mining"
+  action on a wallet that isn't the current miner stops the running
+  process, reassigns both roles to that wallet, and restarts -- always
+  with an explicit confirmation first, never silently.
+- **Balances are live, sync progress is local.** Wallet balances come
+  from a direct `GET_BALANCE` query to the configured peer, independent
+  of whether mining/sync-peer has run recently. Only sync-progress
+  display (frontier height, job status) reads the local workdir replica.
 
 ## Security notes
 

@@ -385,11 +385,7 @@ class AppState:
                 addr = None
             total = 0
             if addr is not None:
-                rc2, out2 = run_binary(
-                    self.bin_dir / "primechain-client",
-                    ["query", self.peer_host, str(self.peer_port), "GET_BALANCE", addr],
-                    env,
-                )
+                rc2, out2 = run_peer_query(self.bin_dir, self.peer_host, self.peer_port, ["GET_BALANCE", addr], env)
                 if rc2 == 0:
                     total = parse_balance_single(out2)
             raw.append(
@@ -694,18 +690,38 @@ def run_binary(binary, args, env, timeout=DEFAULT_CLI_TIMEOUT_SECONDS):
     return result.returncode, (result.stdout or "") + (result.stderr or "")
 
 
-def parse_balance_single(text):
-    """Sums the HOLDING lines from either `primechain-client query <host>
-    <port> GET_BALANCE <addr>` ('BALANCE <addr> <count>\\nHOLDING p amount
-    ...\\nEND_BALANCE') or the workdir-local `balance <store> <wallet>`
-    output -- both just emit a run of 'HOLDING <prime> <amount>' lines,
-    so the same parser covers both."""
-    total = 0
+def run_peer_query(bin_dir, host, port, args, env, timeout=DEFAULT_CLI_TIMEOUT_SECONDS):
+    """Runs `primechain-client query <host> <port> <args...>` and returns
+    (rc, out) like run_binary() -- except the CLI itself exits 0 as long
+    as the network round-trip succeeded, even when the peer's reply is
+    an "ERROR ..." line (e.g. rate limiting, an unknown address). That
+    would otherwise look like a genuine "empty" answer (0 holdings, no
+    nonce) instead of a failed query. Normalize it here so every caller
+    checking rc gets the right answer instead of each needing to
+    remember to check for a leading "ERROR" separately."""
+    rc, out = run_binary(bin_dir / "primechain-client", ["query", host, str(port), *args], env, timeout=timeout)
+    if rc == 0 and out.strip().startswith("ERROR"):
+        return 1, out
+    return rc, out
+
+
+def parse_holdings(text):
+    """Parses the HOLDING lines from either `primechain-client query
+    <host> <port> GET_BALANCE <addr>` ('BALANCE <addr> <count>\\nHOLDING
+    p amount ...\\nEND_BALANCE') or the workdir-local `balance <store>
+    <wallet>` output -- both just emit a run of 'HOLDING <prime>
+    <amount>' lines. Returns [{"prime": int, "micro_units": int}, ...]."""
+    holdings = []
     for line in text.splitlines():
         m = re.match(r"HOLDING (\d+) (\d+)", line)
         if m:
-            total += int(m.group(2))
-    return total
+            holdings.append({"prime": int(m.group(1)), "micro_units": int(m.group(2))})
+    return holdings
+
+
+def parse_balance_single(text):
+    """Sums the HOLDING lines -- see parse_holdings()."""
+    return sum(h["micro_units"] for h in parse_holdings(text))
 
 
 def parse_job_status(text):
@@ -826,6 +842,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._guarded(self._handle_wallet_export)
         if path == "/api/wallets/list_all":
             return self._guarded(self._handle_wallet_list_all)
+        if path == "/api/wallets/holdings":
+            return self._guarded(self._handle_wallet_holdings)
         self.send_error(404)
 
     def do_POST(self):
@@ -1052,6 +1070,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _handle_wallet_holdings(self):
+        # A live GET_BALANCE query, same as the total-balance path -- but
+        # returning the actual per-prime-asset breakdown, not just the
+        # sum. Without this, sending requires knowing offhand which
+        # prime asset # a wallet holds anything of, with no way to find
+        # out from inside the app itself. Doesn't need unlock: reading
+        # holdings is a public query, same as checking a balance.
+        qs = parse_qs(urlsplit(self.path).query)
+        name = (qs.get("name", [""])[0]).strip()
+        if not name:
+            raise CliError("wallet name is required")
+        env = state.env_without_passphrase()
+        address = state.wallets.address_of(name, state.bin_dir, env)
+        rc, out = run_peer_query(state.bin_dir, state.peer_host, state.peer_port, ["GET_BALANCE", address], env)
+        if rc != 0:
+            raise CliError(f"could not read holdings: {out.strip()}")
+        self._send_json({"address": address, "holdings": parse_holdings(out)})
+
     def _handle_mining_start(self):
         state.start_mining()
         self._send_json({"started": True})
@@ -1086,11 +1122,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         sender_address = registry.address_of(sender_name, state.bin_dir, env)
 
-        rc, nonce_out = run_binary(
-            state.bin_dir / "primechain-client",
-            ["query", state.peer_host, str(state.peer_port), "GET_NONCE", sender_address],
-            env,
-        )
+        rc, nonce_out = run_peer_query(state.bin_dir, state.peer_host, state.peer_port, ["GET_NONCE", sender_address], env)
         nonce_info = parse_nonce(nonce_out) if rc == 0 else None
         if nonce_info is None:
             raise CliError(f"could not fetch nonce: {nonce_out.strip()}")
