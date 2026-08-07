@@ -233,6 +233,17 @@ class AppState:
         self.mining_log = collections.deque(maxlen=4000)
         self.mining_failed = False
 
+        # run-jobs doesn't exit or fail when it can't decrypt the mining
+        # identity's signing key -- confirmed live: it logs "wallet
+        # passphrase or authentication failed" and just keeps syncing
+        # and retrying forever, so mining_failed (only set when the
+        # process itself exits non-zero) never catches it. From the
+        # main UI's mining bar, that looks identical to genuinely
+        # mining -- green dot, "Mining running" -- with zero indication
+        # it can never actually submit a winning proof. Track it
+        # separately so the UI can tell the two states apart.
+        self.mining_auth_broken = False
+
         # job-status reads chain.dat directly off disk; landing mid-write
         # by a concurrent sync-download can make the read fail to parse,
         # and primechain-client silently reports frontier=0 instead of
@@ -273,6 +284,142 @@ class AppState:
         # back to the last holdings that *did* load for that wallet.
         self.holdings_lock = threading.Lock()
         self.holdings_cache = {}  # name -> (monotonic_time, holdings_list)
+
+        # Activity (wallet-history + wallet-pending + reward-history) has
+        # no live-network shortcut the way balances do -- wallet-history
+        # alone replays the *entire* local chain on every call, and
+        # nothing was coalescing concurrent callers. A burst of same-
+        # wallet requests (a second tab, a rapid refresh-click, a
+        # wallet-switch racing the periodic poll) used to fan out into
+        # that many full replays in parallel, competing for CPU and
+        # dragging every one of them out -- measured over a minute under
+        # just 8 concurrent requests. One lock per wallet name (not a
+        # single global lock) so concurrent requests for *different*
+        # wallets still run in parallel; only identical requests for the
+        # same wallet coalesce onto one computation, same idea as
+        # probe_lock above but scoped per name instead of process-wide.
+        self.history_meta_lock = threading.Lock()
+        self.history_locks = {}  # name -> Lock
+        self.history_cache = {}  # name -> (monotonic_time, result_dict)
+        self.history_cache_ttl = 3.0
+
+    def _history_lock_for(self, name):
+        with self.history_meta_lock:
+            lock = self.history_locks.get(name)
+            if lock is None:
+                lock = threading.Lock()
+                self.history_locks[name] = lock
+            return lock
+
+    def get_wallet_activity(self, name):
+        """Cached + coalesced wallet-history/wallet-pending/reward-history
+        for one named wallet -- see history_cache_ttl and
+        _history_lock_for above. Raises CliError on a genuine failure
+        (no such wallet, wallet-history itself failing); nothing is
+        cached in that case -- the lock's own context manager releases
+        it on the way out regardless, so a failure here can't wedge
+        future calls the way a hand-rolled "refreshing" flag could."""
+        lock = self._history_lock_for(name)
+        with lock:
+            cached = self.history_cache.get(name)
+            if cached is not None and time.monotonic() - cached[0] < self.history_cache_ttl:
+                return cached[1]
+            result = self._compute_wallet_activity(name)
+            self.history_cache[name] = (time.monotonic(), result)
+            return result
+
+    def _compute_wallet_activity(self, name):
+        wallet_path = self.wallets.named_wallet_path(name)
+        if not wallet_path.exists():
+            raise CliError(f"no wallet named '{name}'")
+        env = self.env_without_passphrase()
+
+        # wallet-pending (a live peer query), wallet-history (a full
+        # local chain.dat replay), and reward-history (another full
+        # replay, computed independently) don't depend on each other --
+        # run them concurrently instead of paying all three latencies
+        # back-to-back.
+        chain_path = self.workdir / "data" / "chain.dat"
+        history_needed = self.workdir_initialized() and chain_path.exists()
+        history_result = {}
+        reward_result = {}
+
+        def fetch_history():
+            rc, out = run_binary(
+                self.bin_dir / "primechain-client",
+                ["wallet-history", str(chain_path), str(wallet_path), "--last", "20"],
+                env,
+            )
+            history_result["rc"] = rc
+            history_result["out"] = out
+
+        # Mining/fee rewards aren't transactions -- they're a direct
+        # ledger credit computed from record ownership (see
+        # SequentialNode::credit()), so wallet-history's transaction
+        # scan never sees them. reward-history recomputes them the same
+        # way `rewards` does, but it's workdir-scoped (whichever wallet
+        # is *currently* the canonical prime/composite identity), not
+        # wallet-scoped -- so it's only meaningful, and only fetched,
+        # for the wallet that's actually in that seat right now. A
+        # wallet that mined in the past but was later swapped out won't
+        # show those old rewards; that's the same limitation `rewards`
+        # already has, not something new here.
+        active = self.wallets.active_names()
+        rewards_needed = history_needed and name in (active.get("prime"), active.get("composite"))
+
+        def fetch_rewards():
+            rc, out = run_binary(
+                self.bin_dir / "primechain-client",
+                ["reward-history", str(self.workdir), "--last", "20"],
+                env,
+            )
+            reward_result["rc"] = rc
+            reward_result["out"] = out
+
+        history_thread = None
+        if history_needed:
+            history_thread = threading.Thread(target=fetch_history)
+            history_thread.start()
+        reward_thread = None
+        if rewards_needed:
+            reward_thread = threading.Thread(target=fetch_rewards)
+            reward_thread.start()
+
+        pending = []
+        rc_p, out_p = run_binary(
+            self.bin_dir / "primechain-client",
+            ["wallet-pending", self.peer_host, str(self.peer_port), str(wallet_path)],
+            env,
+        )
+        if rc_p == 0:
+            pending = parse_wallet_pending(out_p)
+        # A failed pending check (peer rate-limited, timed out) shouldn't
+        # block showing confirmed history -- it just means this refresh
+        # can't say anything new about in-flight transactions.
+
+        if not history_needed:
+            return {"events": pending, "synced": False}
+        history_thread.join()
+        if history_result["rc"] != 0:
+            raise CliError(f"could not read wallet history: {history_result['out'].strip()}")
+        # wallet-history prints oldest-to-newest; reversing gives newest
+        # first, matching the order everything else is displayed in.
+        confirmed = list(reversed(parse_wallet_history(history_result["out"])))
+
+        rewards = []
+        if reward_thread is not None:
+            reward_thread.join()
+            if reward_result["rc"] == 0:
+                rewards = parse_reward_history(reward_result["out"])
+            # A failed reward check shouldn't block the rest of Activity
+            # either -- same reasoning as a failed pending check.
+
+        # Interleave rewards into the confirmed list by the record they
+        # belong to, newest first, instead of bucketing them separately
+        # -- a reward and the transfers in the record that earned it
+        # happened at the same moment.
+        confirmed_and_rewards = sorted(confirmed + rewards, key=lambda ev: ev.get("integer", 0), reverse=True)
+        return {"events": pending + confirmed_and_rewards, "synced": True}
 
     def get_economic_policy(self, env):
         """Cached GET_ECONOMIC_POLICY -- see policy_cache_ttl above."""
@@ -328,15 +475,30 @@ class AppState:
             }
 
     def update_config(self, workdir=None, peer_host=None, peer_port=None, target=None):
+        # Parse/validate every field *before* touching any state. Doing
+        # the int(peer_port) conversion in the same pass as assigning
+        # self.workdir/self.peer_host meant a bad port (or any future
+        # field with a conversion that can fail) raised mid-update,
+        # leaving some fields applied and others not -- a corrupt,
+        # half-saved config with no indication anything was wrong beyond
+        # the error message.
+        new_workdir = Path(workdir).expanduser().resolve() if workdir is not None else None
+        new_peer_port = None
+        if peer_port is not None:
+            try:
+                new_peer_port = int(peer_port)
+            except (TypeError, ValueError) as exc:
+                raise CliError(f"peer port must be a number: {peer_port!r}") from exc
+
         with self.lock:
             if self.is_mining_running():
                 raise CliError("stop mining before changing configuration")
-            if workdir is not None:
-                self.workdir = Path(workdir).expanduser().resolve()
+            if new_workdir is not None:
+                self.workdir = new_workdir
             if peer_host is not None:
                 self.peer_host = peer_host
-            if peer_port is not None:
-                self.peer_port = int(peer_port)
+            if new_peer_port is not None:
+                self.peer_port = new_peer_port
             if target is not None:
                 self.target = str(target)
 
@@ -541,6 +703,11 @@ class AppState:
     def _append_log(self, line):
         with self.lock:
             self.mining_log.append(line.rstrip("\n"))
+            # See mining_auth_broken's docstring above -- this is the
+            # exact line run-jobs logs and keeps going, so it's the only
+            # signal available short of parsing every submission attempt.
+            if "wallet passphrase or authentication failed" in line:
+                self.mining_auth_broken = True
 
     def recent_log(self, since):
         with self.lock:
@@ -562,6 +729,7 @@ class AppState:
         with self.lock:
             self.mining_log.clear()
             self.mining_failed = False
+            self.mining_auth_broken = False
             bin_dir, workdir, target = self.bin_dir, self.workdir, self.target
             thread = threading.Thread(
                 target=self._run_mining_sequence,
@@ -1024,6 +1192,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "job_status": job_status,
                 "mining_running": state.is_mining_running(),
                 "mining_failed": state.mining_failed,
+                "mining_auth_broken": state.mining_auth_broken,
             }
         )
 
@@ -1228,102 +1397,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # live query -- wallet-pending asks the peer directly, same as a
         # balance check -- so a just-submitted send shows up immediately
         # instead of only after it's mined and locally synced.
+        #
+        # The actual computation (wallet-history + wallet-pending +
+        # reward-history, all full local replays or live peer queries)
+        # lives in AppState.get_wallet_activity() -- cached and coalesced
+        # per wallet name, so concurrent identical requests share one
+        # computation instead of each spawning their own subprocesses.
         qs = parse_qs(urlsplit(self.path).query)
         name = (qs.get("name", [""])[0]).strip()
         if not name:
             raise CliError("wallet name is required")
-        wallet_path = state.wallets.named_wallet_path(name)
-        if not wallet_path.exists():
-            raise CliError(f"no wallet named '{name}'")
-        env = state.env_without_passphrase()
-
-        # wallet-pending (a live peer query), wallet-history (a full
-        # local chain.dat replay), and reward-history (another full
-        # replay, computed independently) don't depend on each other --
-        # run them concurrently instead of paying all three latencies
-        # back-to-back.
-        chain_path = state.workdir / "data" / "chain.dat"
-        history_needed = state.workdir_initialized() and chain_path.exists()
-        history_result = {}
-        reward_result = {}
-
-        def fetch_history():
-            rc, out = run_binary(
-                state.bin_dir / "primechain-client",
-                ["wallet-history", str(chain_path), str(wallet_path), "--last", "20"],
-                env,
-            )
-            history_result["rc"] = rc
-            history_result["out"] = out
-
-        # Mining/fee rewards aren't transactions -- they're a direct
-        # ledger credit computed from record ownership (see
-        # SequentialNode::credit()), so wallet-history's transaction
-        # scan never sees them. reward-history recomputes them the same
-        # way `rewards` does, but it's workdir-scoped (whichever wallet
-        # is *currently* the canonical prime/composite identity), not
-        # wallet-scoped -- so it's only meaningful, and only fetched,
-        # for the wallet that's actually in that seat right now. A
-        # wallet that mined in the past but was later swapped out won't
-        # show those old rewards; that's the same limitation `rewards`
-        # already has, not something new here.
-        active = state.wallets.active_names()
-        rewards_needed = history_needed and name in (active.get("prime"), active.get("composite"))
-
-        def fetch_rewards():
-            rc, out = run_binary(
-                state.bin_dir / "primechain-client",
-                ["reward-history", str(state.workdir), "--last", "20"],
-                env,
-            )
-            reward_result["rc"] = rc
-            reward_result["out"] = out
-
-        history_thread = None
-        if history_needed:
-            history_thread = threading.Thread(target=fetch_history)
-            history_thread.start()
-        reward_thread = None
-        if rewards_needed:
-            reward_thread = threading.Thread(target=fetch_rewards)
-            reward_thread.start()
-
-        pending = []
-        rc_p, out_p = run_binary(
-            state.bin_dir / "primechain-client",
-            ["wallet-pending", state.peer_host, str(state.peer_port), str(wallet_path)],
-            env,
-        )
-        if rc_p == 0:
-            pending = parse_wallet_pending(out_p)
-        # A failed pending check (peer rate-limited, timed out) shouldn't
-        # block showing confirmed history -- it just means this refresh
-        # can't say anything new about in-flight transactions.
-
-        if not history_needed:
-            self._send_json({"events": pending, "synced": False})
-            return
-        history_thread.join()
-        if history_result["rc"] != 0:
-            raise CliError(f"could not read wallet history: {history_result['out'].strip()}")
-        # wallet-history prints oldest-to-newest; reversing gives newest
-        # first, matching the order everything else is displayed in.
-        confirmed = list(reversed(parse_wallet_history(history_result["out"])))
-
-        rewards = []
-        if reward_thread is not None:
-            reward_thread.join()
-            if reward_result["rc"] == 0:
-                rewards = parse_reward_history(reward_result["out"])
-            # A failed reward check shouldn't block the rest of Activity
-            # either -- same reasoning as a failed pending check.
-
-        # Interleave rewards into the confirmed list by the record they
-        # belong to, newest first, instead of bucketing them separately
-        # -- a reward and the transfers in the record that earned it
-        # happened at the same moment.
-        confirmed_and_rewards = sorted(confirmed + rewards, key=lambda ev: ev.get("integer", 0), reverse=True)
-        self._send_json({"events": pending + confirmed_and_rewards, "synced": True})
+        self._send_json(state.get_wallet_activity(name))
 
     def _handle_wallet_holdings(self):
         # A live GET_BALANCE query, same as the total-balance path -- but
@@ -1418,7 +1502,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
             env,
         )
         if rc != 0:
-            raise CliError(f"send failed: {send_out.strip()}")
+            reason = send_out.strip()
+            if "wallet passphrase or authentication failed" in reason:
+                # Every wallet primewallet creates/imports is encrypted
+                # under whatever passphrase was active at the time --
+                # there's no per-wallet passphrase tracking (see rekey's
+                # docstring). A wallet imported from elsewhere, or
+                # created before a later passphrase change that didn't
+                # reach it, genuinely won't open under the session's
+                # current passphrase. That's not something retrying or
+                # rekeying (which itself needs to open the wallet first)
+                # can fix from here -- say so plainly instead of
+                # surfacing the raw decrypt-failure string.
+                raise CliError(
+                    f"'{sender_name}' doesn't open with the current passphrase -- "
+                    "it was likely created or imported under a different one. "
+                    "Lock and unlock with that wallet's own passphrase to use it."
+                )
+            raise CliError(f"send failed: {reason}")
+        # The frontend deliberately re-fetches Activity right after a
+        # successful send so the new pending entry shows up immediately
+        # (see refreshAccountActivity in app.js) -- without dropping the
+        # cached entry here, a send arriving within history_cache_ttl of
+        # the last fetch would just get served that same stale,
+        # pre-send snapshot back, silently defeating the whole point.
+        with state._history_lock_for(sender_name):
+            state.history_cache.pop(sender_name, None)
         self._send_json({"result": send_out.strip(), "nonce_used": nonce_info["next"]})
 
 

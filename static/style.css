@@ -228,6 +228,7 @@ input[readonly] { opacity: 0.7; cursor: default; }
   font-size: 0.85rem;
 }
 .global-mining-banner .secondary-btn { flex: none; padding: 0.35rem 0.8rem; font-size: 0.8rem; }
+.global-mining-banner.warn { border-color: var(--err); }
 #global-mining-text { flex: 1; }
 
 /* -- account switcher -- */
