@@ -153,6 +153,16 @@
         <button id="open-receive-btn" class="secondary-btn" type="button">Receive</button>
         <button id="export-wallet-btn" class="secondary-btn" type="button">Export</button>
       </div>
+
+      <div class="account-activity">
+        <div class="account-activity-header">
+          <span>Activity</span>
+          <button id="refresh-activity-btn" class="icon-btn small" title="refresh" type="button">&#8635;</button>
+        </div>
+        <div id="account-activity-list" class="account-activity-list">
+          <p class="muted tiny">-</p>
+        </div>
+      </div>
     </div>
 
     <div class="mining-bar">
@@ -164,7 +174,7 @@
     </div>
     <div id="job-status" class="job-status muted tiny"></div>
 
-    <button id="activity-toggle" class="link-btn full" type="button">Activity &#9662;</button>
+    <button id="activity-toggle" class="link-btn full" type="button">Mining log &#9662;</button>
     <section id="activity-panel" class="activity-panel hidden">
       <pre id="log"></pre>
     </section>

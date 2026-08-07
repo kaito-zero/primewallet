@@ -387,6 +387,49 @@ input[readonly] { opacity: 0.7; cursor: default; }
 
 .action-row { display: flex; gap: 0.6rem; }
 
+.account-activity {
+  margin-top: 1rem;
+  text-align: left;
+  border-top: 1px solid var(--border);
+  padding-top: 0.75rem;
+}
+.account-activity-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--muted);
+  margin-bottom: 0.4rem;
+}
+.account-activity-list {
+  max-height: 12rem;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+.activity-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.5rem 0.1rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.82rem;
+}
+.activity-row:last-child { border-bottom: none; }
+.activity-row-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+.activity-row-amount { flex-shrink: 0; font-weight: 600; font-family: ui-monospace, monospace; }
+.activity-row.in .activity-row-amount { color: var(--ok); }
+.activity-row.out .activity-row-amount { color: var(--text); }
+.activity-row.fee .activity-row-amount,
+.activity-row.fee .activity-row-label { color: var(--muted); }
+
 /* -- mining bar -- */
 
 .mining-bar {
@@ -452,11 +495,15 @@ input[readonly] { opacity: 0.7; cursor: default; }
   padding: 1.25rem;
   width: 100%;
   max-width: 380px;
+  max-height: 90vh;
+  overflow-y: auto;
   box-shadow: var(--shadow);
   display: flex;
   flex-direction: column;
   gap: 0.7rem;
 }
+.modal * { min-width: 0; } /* long unbroken text (tx hashes, addresses) must wrap, not push the modal wider */
+#send-result, #rekey-result { overflow-wrap: break-word; }
 .modal-header {
   display: flex;
   align-items: center;

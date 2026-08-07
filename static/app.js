@@ -238,6 +238,8 @@ function closeDropdown() {
   hide("account-dropdown");
 }
 
+let lastActivityWalletName = null;
+
 function renderAccountCard(state, name) {
   const wallet = findWallet(state, name);
   const bigAvatar = el("account-avatar-big");
@@ -254,7 +256,17 @@ function renderAccountCard(state, name) {
     balanceEl.textContent = "0";
     primeBtn.disabled = true;
     compositeBtn.disabled = true;
+    lastActivityWalletName = null;
+    renderActivityList(null);
     return;
+  }
+
+  // Fetch history only when the viewed wallet actually changes, not on
+  // every state poll -- it's a local chain.dat scan, not something to
+  // redo every 3 seconds for no reason.
+  if (wallet.name !== lastActivityWalletName) {
+    lastActivityWalletName = wallet.name;
+    refreshAccountActivity(wallet.name);
   }
 
   bigAvatar.textContent = wallet.name.slice(0, 1).toUpperCase();
@@ -281,6 +293,72 @@ function renderAccountCard(state, name) {
         ? `assigned to mine the ${role} role once you start -- click to keep it, pick another wallet to move it`
         : `make this wallet the ${role} miner`;
     }
+  }
+}
+
+let activityRequestId = 0;
+
+async function refreshAccountActivity(name) {
+  const requestId = ++activityRequestId; // an older, slower request must not overwrite a newer one
+  const list = el("account-activity-list");
+  list.innerHTML = "";
+  const loading = document.createElement("p");
+  loading.className = "muted tiny";
+  loading.textContent = "loading...";
+  list.appendChild(loading);
+
+  let data;
+  try {
+    data = await api(`/api/wallets/history?name=${encodeURIComponent(name)}`);
+  } catch (err) {
+    if (requestId !== activityRequestId) return;
+    list.innerHTML = "";
+    const p = document.createElement("p");
+    p.className = "muted tiny";
+    p.textContent = `could not load activity: ${err.message}`;
+    list.appendChild(p);
+    return;
+  }
+  if (requestId !== activityRequestId) return; // a newer request already landed
+  renderActivityList(data);
+}
+
+function renderActivityList(data) {
+  const list = el("account-activity-list");
+  list.innerHTML = "";
+  const empty = (text) => {
+    const p = document.createElement("p");
+    p.className = "muted tiny";
+    p.textContent = text;
+    list.appendChild(p);
+  };
+  if (!data) return empty("-");
+  if (!data.synced) return empty("not synced locally yet -- start mining once to pull chain history");
+  if (!data.events || data.events.length === 0) return empty("no activity yet");
+
+  for (const ev of [...data.events].reverse()) { // newest first
+    const row = document.createElement("div");
+    const isReceived = ev.direction === "received";
+    const isFee = ev.direction === "fee-paid";
+    row.className = "activity-row " + (isReceived ? "in" : isFee ? "fee" : "out");
+
+    const label = document.createElement("div");
+    label.className = "activity-row-label";
+    if (isFee) {
+      label.textContent = "Network fee";
+    } else {
+      const other = isReceived ? ev.sender : ev.receiver;
+      label.textContent = `${isReceived ? "Received from" : "Sent to"} ${shortAddress(other)}`;
+      label.title = other || "";
+    }
+
+    const amount = document.createElement("div");
+    amount.className = "activity-row-amount";
+    amount.textContent = `${isReceived ? "+" : "-"}${ev.amount_micro_units} (#${ev.prime})`;
+
+    row.appendChild(label);
+    row.appendChild(amount);
+    list.appendChild(row);
   }
 }
 
@@ -817,6 +895,10 @@ onClick("copy-address-btn", async () => {
   if (!wallet || !wallet.address) throw new Error("no address to copy yet");
   const ok = await copyToClipboard(wallet.address);
   showToast(ok ? "Address copied" : "Could not copy -- copy it manually from Receive");
+});
+
+el("refresh-activity-btn").addEventListener("click", () => {
+  if (selectedWalletName) refreshAccountActivity(selectedWalletName);
 });
 
 el("toggle-prime").addEventListener("click", () => activateRole("prime"));

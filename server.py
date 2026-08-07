@@ -376,14 +376,30 @@ class AppState:
         if rc == 0:
             job_status = self.smooth_frontier(parse_job_status(out))
 
+        # Querying every wallet's balance back-to-back in a tight loop is
+        # exactly the kind of burst a peer's connection-rate-limit is
+        # designed to catch -- and when one call in the middle of the
+        # loop gets rejected for it, defaulting straight to 0 would
+        # *cache* a wrong balance for that one wallet until the next
+        # refresh happens to succeed for it. Carry forward the last
+        # known-good balance per address instead, and spread the calls
+        # out a little so a burst is less likely to trigger the limit
+        # in the first place.
+        with self.probe_lock:
+            previous_raw = self.probe_cache[1][0] if self.probe_cache is not None else []
+        last_known_by_addr = {w["address"]: w["total_micro_units"] for w in previous_raw if w["address"]}
+
         registry = self.wallets
         active = registry.active_names()
-        for name in registry.list_names():
+        names = registry.list_names()
+        for i, name in enumerate(names):
+            if i > 0:
+                time.sleep(0.2)
             try:
                 addr = registry.address_of(name, self.bin_dir, env)
             except CliError:
                 addr = None
-            total = 0
+            total = last_known_by_addr.get(addr, 0) if addr is not None else 0
             if addr is not None:
                 rc2, out2 = run_peer_query(self.bin_dir, self.peer_host, self.peer_port, ["GET_BALANCE", addr], env)
                 if rc2 == 0:
@@ -766,6 +782,26 @@ def parse_economic_policy(text):
     return values
 
 
+def parse_wallet_history(text):
+    # "TX_EVENT integer=... height=... kind=... confirmations=...
+    #  direction=sent|received|fee-paid tx_hash=... version=... nonce=...
+    #  prime=... amount_micro_units=... amount_denominator=... sender=...
+    #  receiver=..."
+    events = []
+    int_fields = {"integer", "height", "confirmations", "nonce", "prime", "amount_micro_units", "amount_denominator"}
+    for line in text.splitlines():
+        if not line.startswith("TX_EVENT"):
+            continue
+        fields = {}
+        for token in line.split()[1:]:
+            if "=" not in token:
+                continue
+            key, _, value = token.partition("=")
+            fields[key] = int(value) if key in int_fields and value.isdigit() else value
+        events.append(fields)
+    return events
+
+
 def find_default_bin_dir():
     """primewallet is a standalone tool -- it isn't nested inside a
     primechain checkout, so there's no single "correct" relative path to
@@ -869,6 +905,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._guarded(self._handle_wallet_list_all)
         if path == "/api/wallets/holdings":
             return self._guarded(self._handle_wallet_holdings)
+        if path == "/api/wallets/history":
+            return self._guarded(self._handle_wallet_history)
         self.send_error(404)
 
     def do_POST(self):
@@ -1094,6 +1132,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _handle_wallet_history(self):
+        # Transaction history, MetaMask-Activity-tab style. Unlike
+        # balances/holdings, there's no live network query for this --
+        # wallet-history reads it out of the *local* chain.dat replay,
+        # so it's only as current as the last sync (recall: mining is
+        # the only thing that runs sync-peer). Doesn't need unlock,
+        # same reasoning as balances: this is public on-chain data, not
+        # anything requiring the signing key.
+        qs = parse_qs(urlsplit(self.path).query)
+        name = (qs.get("name", [""])[0]).strip()
+        if not name:
+            raise CliError("wallet name is required")
+        wallet_path = state.wallets.named_wallet_path(name)
+        if not wallet_path.exists():
+            raise CliError(f"no wallet named '{name}'")
+        chain_path = state.workdir / "data" / "chain.dat"
+        if not state.workdir_initialized() or not chain_path.exists():
+            self._send_json({"events": [], "synced": False})
+            return
+        env = state.env_without_passphrase()
+        rc, out = run_binary(
+            state.bin_dir / "primechain-client",
+            ["wallet-history", str(chain_path), str(wallet_path), "--last", "20"],
+            env,
+        )
+        if rc != 0:
+            raise CliError(f"could not read wallet history: {out.strip()}")
+        self._send_json({"events": parse_wallet_history(out), "synced": True})
 
     def _handle_wallet_holdings(self):
         # A live GET_BALANCE query, same as the total-balance path -- but
