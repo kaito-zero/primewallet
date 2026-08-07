@@ -243,17 +243,19 @@ class AppState:
         # real backward progress. Reset whenever a fresh sync starts.
         self.frontier_floor = 0
 
-        # balances/job-status shell out to primechain-client and read
-        # the workdir's chain.dat -- while a sync is actively writing to
-        # that file, each call can take a while. Without this, every
-        # concurrent /api/state request (multiple browser tabs, rapid
-        # polling, etc.) would launch its own pair of subprocesses that
-        # all fight over the same file, piling up. This lock makes
-        # concurrent callers wait for one in-flight computation instead
-        # of starting their own; the short TTL cache means callers that
-        # arrive moments apart get the same recent answer for free.
+        # get_wallets_info() shells out to primechain-client once per
+        # wallet (a live GET_BALANCE query) plus once for job-status,
+        # which reads the workdir's chain.dat -- while a sync is
+        # actively writing to that file, the job-status call can take a
+        # while. Without this, every concurrent /api/state request
+        # (multiple browser tabs, rapid polling, etc.) would launch its
+        # own set of subprocesses fighting over the same file. This lock
+        # makes concurrent callers wait for one in-flight computation
+        # instead of starting their own; the short TTL cache means
+        # callers that arrive moments apart get the same recent answer
+        # for free.
         self.probe_lock = threading.Lock()
-        self.probe_cache = None  # (monotonic_time, (raw_wallets, balances, job_status))
+        self.probe_cache = None  # (monotonic_time, (raw_wallets, job_status))
         self.probe_cache_ttl = 2.0
         self.probe_refreshing = False
 
@@ -353,40 +355,52 @@ class AppState:
     # -- wallet/balance probing (locked + cached; see probe_lock) -------
 
     def _compute_raw_wallets_info(self):
-        """The expensive part: shells out to primechain-client for
-        balances/job-status and reads every named wallet's address.
-        Never call directly -- go through get_wallets_info(), which
-        holds probe_lock around this so concurrent callers share one
-        computation instead of racing their own subprocesses."""
-        balances, job_status, raw = [], {}, []
+        """The expensive part: reads every named wallet's address and
+        asks the peer directly for each one's live balance (GET_BALANCE
+        -- a query against the network's actual current state, not our
+        local chain.dat replica). A wallet's local copy only advances
+        when sync-peer runs, which only happens as part of mining --
+        querying the peer directly means the balance shown is always
+        current regardless of whether mining is running. job-status is
+        still read locally, since sync progress is legitimately about
+        local state. Never call directly -- go through
+        get_wallets_info(), which holds probe_lock around this so
+        concurrent callers share one computation instead of racing
+        their own subprocesses."""
+        job_status, raw = {}, []
         if not self.workdir_initialized():
-            return raw, balances, job_status
+            return raw, job_status
 
         env = self.env_without_passphrase()
-        rc, out = run_binary(self.bin_dir / "primechain-client", ["balances", str(self.workdir)], env)
+        rc, out = run_binary(self.bin_dir / "primechain-client", ["job-status", str(self.workdir)], env)
         if rc == 0:
-            balances = parse_balances(out)
-        rc2, out2 = run_binary(self.bin_dir / "primechain-client", ["job-status", str(self.workdir)], env)
-        if rc2 == 0:
-            job_status = self.smooth_frontier(parse_job_status(out2))
+            job_status = self.smooth_frontier(parse_job_status(out))
 
         registry = self.wallets
         active = registry.active_names()
-        balance_by_addr = {w["address"]: w["total_micro_units"] for w in balances}
         for name in registry.list_names():
             try:
                 addr = registry.address_of(name, self.bin_dir, env)
             except CliError:
                 addr = None
+            total = 0
+            if addr is not None:
+                rc2, out2 = run_binary(
+                    self.bin_dir / "primechain-client",
+                    ["query", self.peer_host, str(self.peer_port), "GET_BALANCE", addr],
+                    env,
+                )
+                if rc2 == 0:
+                    total = parse_balance_single(out2)
             raw.append(
                 {
                     "name": name,
                     "address": addr,
-                    "total_micro_units": balance_by_addr.get(addr, 0),
+                    "total_micro_units": total,
                     "active_roles": [r for r, n in active.items() if n == name],
                 }
             )
-        return raw, balances, job_status
+        return raw, job_status
 
     def _refresh_probe_cache_now(self):
         """Does the actual expensive work and stores the result. Called
@@ -400,7 +414,7 @@ class AppState:
             self.probe_refreshing = False
 
     def get_wallets_info(self, include_inert):
-        """Returns (wallets_info, balances, job_status). `include_inert`
+        """Returns (wallets_info, job_status). `include_inert`
         controls only cheap post-hoc filtering (hiding empty, unused
         default-prime/default-composite leftovers) -- it never affects
         whether the underlying probe runs or is cached, so the filtered
@@ -434,7 +448,7 @@ class AppState:
         # defensive: another thread could have invalidated the cache in
         # the instant between the check above and this read -- narrow,
         # but don't let that crash the request, just fall back to empty
-        raw, balances, job_status = cache[1] if cache is not None else ([], [], {})
+        raw, job_status = cache[1] if cache is not None else ([], {})
 
         if include_inert:
             wallets_info = list(raw)
@@ -448,7 +462,7 @@ class AppState:
                     and not w["active_roles"]
                 )
             ]
-        return wallets_info, balances, job_status
+        return wallets_info, job_status
 
     def invalidate_probe_cache(self):
         """Call after any wallet-mutating action (create/import/delete/
@@ -520,7 +534,7 @@ class AppState:
             # than its own direct call -- otherwise this 4-second timer
             # and a browser's state poll could each launch their own
             # job-status against the same chain.dat at once.
-            _, _, job_status = self.get_wallets_info(include_inert=True)
+            _, job_status = self.get_wallets_info(include_inert=True)
             frontier = job_status.get("LOCAL_FRONTIER")
             return f"[syncing] local frontier: {frontier}" if frontier is not None else None
 
@@ -680,32 +694,12 @@ def run_binary(binary, args, env, timeout=DEFAULT_CLI_TIMEOUT_SECONDS):
     return result.returncode, (result.stdout or "") + (result.stderr or "")
 
 
-def parse_balances(text):
-    wallets = []
-    current = None
-    for line in text.splitlines():
-        m = re.match(r"WALLET (\S+) (\S+) holdings=(\d+) total_micro_units=(\d+)", line)
-        if m:
-            current = {
-                "role": m.group(1),
-                "address": m.group(2),
-                "holdings": int(m.group(3)),
-                "total_micro_units": int(m.group(4)),
-                "assets": [],
-            }
-            wallets.append(current)
-            continue
-        m = re.match(r"HOLDING (\d+) (\d+)", line)
-        if m and current is not None:
-            current["assets"].append(
-                {"prime": int(m.group(1)), "micro_units": int(m.group(2))}
-            )
-    return wallets
-
-
 def parse_balance_single(text):
-    """Parse `primechain-client balance <store> <wallet>` (singular) output:
-    'address: <addr>\\nholdings: N\\nHOLDING p amount\\n...'"""
+    """Sums the HOLDING lines from either `primechain-client query <host>
+    <port> GET_BALANCE <addr>` ('BALANCE <addr> <count>\\nHOLDING p amount
+    ...\\nEND_BALANCE') or the workdir-local `balance <store> <wallet>`
+    output -- both just emit a run of 'HOLDING <prime> <amount>' lines,
+    so the same parser covers both."""
     total = 0
     for line in text.splitlines():
         m = re.match(r"HOLDING (\d+) (\d+)", line)
@@ -857,14 +851,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _handle_state(self):
         cfg = state.snapshot_config()
-        wallets_info, balances, job_status = state.get_wallets_info(include_inert=False)
+        wallets_info, job_status = state.get_wallets_info(include_inert=False)
         self._send_json(
             {
                 "config": cfg,
                 "workdir_initialized": state.workdir_initialized(),
                 "has_any_wallet": state.wallets.has_any_wallet(),
                 "wallets": wallets_info,
-                "balances": balances,
                 "job_status": job_status,
                 "mining_running": state.is_mining_running(),
                 "mining_failed": state.mining_failed,
@@ -872,7 +865,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         )
 
     def _handle_wallet_list_all(self):
-        wallets_info, _, _ = state.get_wallets_info(include_inert=True)
+        wallets_info, _ = state.get_wallets_info(include_inert=True)
         self._send_json({"wallets": wallets_info})
 
     def _handle_log(self):
