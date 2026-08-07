@@ -754,6 +754,18 @@ def parse_nonce(text):
     return None
 
 
+def parse_economic_policy(text):
+    # "ECONOMIC_POLICY transfer_fee_micro_units=1 validator_min_reserve_micro_units=... ..."
+    values = {}
+    for token in text.split():
+        if "=" not in token:
+            continue
+        key, _, value = token.partition("=")
+        if value.isdigit():
+            values[key] = int(value)
+    return values
+
+
 def find_default_bin_dir():
     """primewallet is a standalone tool -- it isn't nested inside a
     primechain checkout, so there's no single "correct" relative path to
@@ -1090,6 +1102,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # prime asset # a wallet holds anything of, with no way to find
         # out from inside the app itself. Doesn't need unlock: reading
         # holdings is a public query, same as checking a balance.
+        #
+        # Also includes the network's current transfer fee. It isn't a
+        # free choice -- an authenticated transfer is only valid if its
+        # fee exactly equals the active protocol fee (verified in
+        # SequentialNode's tx validation), so a client-side "pick any
+        # fee" field would just be a way to submit transactions that
+        # silently fail to validate. Fetch the real one instead of
+        # hardcoding a guess that can go stale if the network's fee
+        # policy ever changes.
         qs = parse_qs(urlsplit(self.path).query)
         name = (qs.get("name", [""])[0]).strip()
         if not name:
@@ -1099,7 +1120,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         rc, out = run_peer_query(state.bin_dir, state.peer_host, state.peer_port, ["GET_BALANCE", address], env)
         if rc != 0:
             raise CliError(f"could not read holdings: {out.strip()}")
-        self._send_json({"address": address, "holdings": parse_holdings(out)})
+        rc2, policy_out = run_peer_query(state.bin_dir, state.peer_host, state.peer_port, ["GET_ECONOMIC_POLICY"], env)
+        fee = parse_economic_policy(policy_out).get("transfer_fee_micro_units") if rc2 == 0 else None
+        self._send_json({"address": address, "holdings": parse_holdings(out), "transfer_fee_micro_units": fee})
 
     def _handle_mining_start(self):
         state.start_mining()

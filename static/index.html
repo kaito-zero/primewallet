@@ -175,13 +175,21 @@
     <div class="modal">
       <div class="modal-header"><h2>Send</h2><button id="close-send-btn" class="icon-btn" type="button">&#10005;</button></div>
       <label>From <select id="send-from"></select></label>
-      <label>To <input id="send-receiver" type="text" placeholder="pcpq1_..."></label>
+      <label>To
+        <input id="send-receiver" type="text" placeholder="pcpq1_..." list="send-receiver-suggestions" autocomplete="off">
+        <datalist id="send-receiver-suggestions"></datalist>
+      </label>
       <div class="panel-row two-col">
         <label>Prime asset # <select id="send-prime"></select></label>
-        <label>Amount <input id="send-amount" type="number" min="1"></label>
+        <label>Amount
+          <span class="input-with-button">
+            <input id="send-amount" type="number" min="1">
+            <button id="send-max-btn" class="link-btn" type="button">Max</button>
+          </span>
+        </label>
       </div>
       <div id="send-holding-hint" class="muted tiny"></div>
-      <label>Fee <input id="send-fee" type="number" min="0" value="1"></label>
+      <label>Fee <input id="send-fee" type="number" min="0" value="1" readonly title="Set by the network -- a transfer's fee must exactly match the current protocol fee, so it isn't a free choice."></label>
       <button id="send-submit-btn" class="primary-btn" type="button">Send</button>
       <div id="send-result" class="muted small"></div>
     </div>

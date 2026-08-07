@@ -128,6 +128,20 @@ input, select {
   width: 100%;
 }
 input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+input[readonly] { opacity: 0.7; cursor: default; }
+
+.input-with-button {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+}
+.input-with-button input { flex: 1; }
+.input-with-button .link-btn {
+  flex-shrink: 0;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
 
 .primary-btn {
   background: var(--accent);

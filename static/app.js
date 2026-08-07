@@ -430,11 +430,26 @@ function openSendModal() {
   el("send-result").textContent = "";
   show("send-modal");
   if (selectedWalletName) el("send-from").value = selectedWalletName;
+  populateSendReceiverSuggestions();
   refreshSendHoldings();
 }
 function closeSendModal() { hide("send-modal"); }
 
+function populateSendReceiverSuggestions() {
+  const list = el("send-receiver-suggestions");
+  list.innerHTML = "";
+  if (!lastState) return;
+  for (const w of lastState.wallets) {
+    if (!w.address) continue;
+    const opt = document.createElement("option");
+    opt.value = w.address;
+    opt.label = w.name;
+    list.appendChild(opt);
+  }
+}
+
 let sendHoldingsRequestId = 0;
+let currentSendFee = null; // micro-units, from the network's live economic policy
 
 async function refreshSendHoldings() {
   const name = el("send-from").value;
@@ -451,6 +466,10 @@ async function refreshSendHoldings() {
   try {
     const data = await api(`/api/wallets/holdings?name=${encodeURIComponent(name)}`);
     holdings = data.holdings || [];
+    if (data.transfer_fee_micro_units !== null && data.transfer_fee_micro_units !== undefined) {
+      currentSendFee = data.transfer_fee_micro_units;
+      el("send-fee").value = currentSendFee;
+    }
   } catch (err) {
     if (requestId !== sendHoldingsRequestId) return;
     hint.textContent = `could not load holdings: ${err.message}`;
@@ -882,6 +901,15 @@ el("open-send-btn").addEventListener("click", openSendModal);
 el("close-send-btn").addEventListener("click", closeSendModal);
 el("send-from").addEventListener("change", refreshSendHoldings);
 el("send-prime").addEventListener("change", updateSendHoldingHint);
+el("send-max-btn").addEventListener("click", () => {
+  const select = el("send-prime");
+  const opt = select.options[select.selectedIndex];
+  if (!opt) return;
+  const available = parseInt(opt.dataset.microUnits, 10);
+  const fee = currentSendFee !== null ? currentSendFee : parseInt(el("send-fee").value || "0", 10);
+  const max = available - fee;
+  el("send-amount").value = max > 0 ? max : 0;
+});
 el("open-receive-btn").addEventListener("click", openReceiveModal);
 el("close-receive-btn").addEventListener("click", closeReceiveModal);
 el("close-create-btn").addEventListener("click", closeCreateModal);
