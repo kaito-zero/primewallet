@@ -313,11 +313,32 @@ function renderMiningBar(state) {
   btn.disabled = false; // clicking always does something sensible now -- see onClick("mining-toggle-btn")
   btn.title = "";
 
-  const entries = Object.entries(state.job_status || {});
-  el("job-status").textContent = entries.length
-    ? entries.map(([k, v]) => `${k}: ${v}`).join("  ·  ")
-    : "";
-  el("job-status").classList.toggle("active", running);
+  renderJobStatusLine(state.job_status || {}, running);
+}
+
+function renderJobStatusLine(jobStatus, running) {
+  const el_ = el("job-status");
+  const entries = Object.entries(jobStatus);
+  if (!entries.length) {
+    el_.textContent = "";
+    el_.title = "";
+    el_.classList.toggle("active", running);
+    return;
+  }
+  // The raw job-status has workdir/peer/timestamps in it too --
+  // useful for debugging, not for a glance at the mining bar. Show
+  // just the two numbers that actually change while you watch, keep
+  // the full dump as a tooltip for anyone who wants it.
+  const parts = [];
+  if (jobStatus.LOCAL_FRONTIER !== undefined) {
+    parts.push(`local frontier: ${jobStatus.LOCAL_FRONTIER}`);
+  }
+  if (jobStatus.JOB_STATUS !== undefined) {
+    parts.push(jobStatus.JOB_STATUS.replace(/-/g, " "));
+  }
+  el_.textContent = parts.join("  ·  ");
+  el_.title = entries.map(([k, v]) => `${k}: ${v}`).join("\n");
+  el_.classList.toggle("active", running);
 }
 
 function renderSendFrom(state) {
