@@ -10,7 +10,8 @@ It's a thin UI over the existing `primechain-client` / `primechain-wallet` / `pr
 - Unlock with a wallet passphrase, held in the server process's memory only, never written to disk or logged.
 - Create any number of named wallets, or import one from a backup `.wallet` file. Each one can independently hold the prime-mining role, the composite-mining role, both, or neither -- switch which wallet does what per role, per wallet, from its own account card, the same way you'd switch accounts in a browser wallet.
 - Start/stop mining (`sync-peer` -> `add-mine-job` -> `run-jobs`) with live streaming output; a persistent banner shows mining status on every screen, since a mining process can outlive a wallet's own bookkeeping.
-- Check balances and send transactions between wallets.
+- Check balances and send transactions between wallets, with live per-prime-asset holdings, the network's current transfer fee, and a Max button in the Send flow.
+- Per-wallet Activity, MetaMask-style: confirmed transfers, mining/fee rewards, and pending (mempool) transactions shown the moment they're submitted -- newest first, all reconciled against the chain, not just a raw process log.
 - Export a wallet to a `.wallet` file, or change the passphrase for every wallet in the workdir that currently opens with it, from Settings.
 - Manage tab lists every wallet in the workdir (including ones the account switcher hides because they're empty and unused) and lets you delete any of them -- doesn't require being unlocked, since deleting a wallet you're locked out of is exactly the point.
 
