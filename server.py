@@ -403,8 +403,21 @@ class AppState:
         either inline (nothing cached yet -- this one caller has no
         choice but to wait) or from a background thread (stale-while-
         revalidate -- everyone else keeps getting the old answer,
-        instantly, until this finishes)."""
-        result = self._compute_raw_wallets_info()
+        instantly, until this finishes).
+
+        Must clear probe_refreshing on the way out no matter what --
+        _compute_raw_wallets_info() can raise CliError (a query that
+        times out, say), and a background refresh that raises without
+        clearing this flag would permanently wedge every future call:
+        get_wallets_info() only ever starts a new background refresh
+        when probe_refreshing is False, so one failed attempt would
+        otherwise freeze the cache at its last value forever."""
+        try:
+            result = self._compute_raw_wallets_info()
+        except Exception:
+            with self.probe_lock:
+                self.probe_refreshing = False
+            raise
         with self.probe_lock:
             self.probe_cache = (time.monotonic(), result)
             self.probe_refreshing = False
