@@ -333,14 +333,20 @@ function renderActivityList(data) {
     list.appendChild(p);
   };
   if (!data) return empty("-");
-  if (!data.synced) return empty("not synced locally yet -- start mining once to pull chain history");
-  if (!data.events || data.events.length === 0) return empty("no activity yet");
+  const events = data.events || [];
+  if (events.length === 0) {
+    // Pending events come from a live mempool query and don't need a
+    // local sync -- only "nothing at all to show" depends on that.
+    if (!data.synced) return empty("not synced locally yet -- start mining once to pull chain history");
+    return empty("no activity yet");
+  }
 
-  for (const ev of [...data.events].reverse()) { // newest first
+  // Already newest-first, pending on top -- see _handle_wallet_history.
+  for (const ev of events) {
     const row = document.createElement("div");
     const isReceived = ev.direction === "received";
     const isFee = ev.direction === "fee-paid";
-    row.className = "activity-row " + (isReceived ? "in" : isFee ? "fee" : "out");
+    row.className = "activity-row " + (isReceived ? "in" : isFee ? "fee" : "out") + (ev.pending ? " pending" : "");
 
     const label = document.createElement("div");
     label.className = "activity-row-label";
@@ -350,6 +356,12 @@ function renderActivityList(data) {
       const other = isReceived ? ev.sender : ev.receiver;
       label.textContent = `${isReceived ? "Received from" : "Sent to"} ${shortAddress(other)}`;
       label.title = other || "";
+    }
+    if (ev.pending) {
+      const badge = document.createElement("span");
+      badge.className = "pending-badge";
+      badge.textContent = "pending";
+      label.appendChild(badge);
     }
 
     const amount = document.createElement("div");
@@ -528,6 +540,7 @@ function populateSendReceiverSuggestions() {
 
 let sendHoldingsRequestId = 0;
 let currentSendFee = null; // micro-units, from the network's live economic policy
+let sendHoldingsStale = false; // last live balance check failed -- holdings shown are a cached fallback
 
 async function refreshSendHoldings() {
   const name = el("send-from").value;
@@ -544,6 +557,7 @@ async function refreshSendHoldings() {
   try {
     const data = await api(`/api/wallets/holdings?name=${encodeURIComponent(name)}`);
     holdings = data.holdings || [];
+    sendHoldingsStale = !!data.stale;
     if (data.transfer_fee_micro_units !== null && data.transfer_fee_micro_units !== undefined) {
       currentSendFee = data.transfer_fee_micro_units;
       el("send-fee").value = currentSendFee;
@@ -573,7 +587,13 @@ function updateSendHoldingHint() {
   const select = el("send-prime");
   const hint = el("send-holding-hint");
   const opt = select.options[select.selectedIndex];
-  hint.textContent = opt ? `available: ${opt.dataset.microUnits}` : "";
+  const available = opt ? `available: ${opt.dataset.microUnits}` : "";
+  // The live balance check failed (peer busy/rate-limited) and this is
+  // the last holdings snapshot that *did* load, not necessarily what the
+  // wallet holds right now -- say so instead of presenting it as current.
+  hint.textContent = sendHoldingsStale
+    ? [available, "showing last known holdings -- network is slow to respond"].filter(Boolean).join(" -- ")
+    : available;
 }
 
 function openReceiveModal() {
@@ -1065,13 +1085,26 @@ onClick("send-submit-btn", async () => {
   if (!body.receiver || !Number.isFinite(body.prime) || !Number.isFinite(body.amount)) {
     throw new Error("receiver, prime asset #, and amount are required");
   }
-  const result = await api("/api/send", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  el("send-result").textContent = result.result;
-  showToast("Sent");
+  const btn = el("send-submit-btn");
+  const originalLabel = btn.textContent;
+  btn.textContent = "Sending...";
+  el("send-result").textContent = "";
+  try {
+    const result = await api("/api/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    el("send-result").textContent = result.result;
+    showToast("Sent");
+    // It won't show up in wallet-history until it's mined and locally
+    // synced, but it's in the peer's mempool right away -- refresh
+    // Activity now (unconditionally, not gated on wallet-switch) so the
+    // pending entry appears immediately instead of on the next 3s poll.
+    if (body.from === lastActivityWalletName) refreshAccountActivity(body.from);
+  } finally {
+    btn.textContent = originalLabel;
+  }
 });
 
 // close modals on backdrop click / Escape

@@ -259,6 +259,40 @@ class AppState:
         self.probe_cache_ttl = 2.0
         self.probe_refreshing = False
 
+        # The network's transfer fee changes rarely if ever, but the Send
+        # modal needs it every time it opens (see _handle_wallet_holdings).
+        # No reason to pay a live round-trip for it on every holdings
+        # lookup -- cache it generously.
+        self.policy_lock = threading.Lock()
+        self.policy_cache = None  # (monotonic_time, {key: value})
+        self.policy_cache_ttl = 20.0
+
+        # GET_BALANCE is a live query against a public, rate-limited peer
+        # -- it can time out or get rejected transiently. Rather than
+        # showing an empty "no assets to send" dropdown on a hiccup, fall
+        # back to the last holdings that *did* load for that wallet.
+        self.holdings_lock = threading.Lock()
+        self.holdings_cache = {}  # name -> (monotonic_time, holdings_list)
+
+    def get_economic_policy(self, env):
+        """Cached GET_ECONOMIC_POLICY -- see policy_cache_ttl above."""
+        with self.policy_lock:
+            if self.policy_cache is not None and time.monotonic() - self.policy_cache[0] < self.policy_cache_ttl:
+                return self.policy_cache[1]
+        rc, out = run_peer_query(self.bin_dir, self.peer_host, self.peer_port, ["GET_ECONOMIC_POLICY"], env)
+        if rc != 0:
+            # Serve a stale value rather than nothing if we have one --
+            # a fee that's a few minutes old is far more useful than no
+            # fee at all for a field that rarely changes.
+            with self.policy_lock:
+                if self.policy_cache is not None:
+                    return self.policy_cache[1]
+            return {}
+        values = parse_economic_policy(out)
+        with self.policy_lock:
+            self.policy_cache = (time.monotonic(), values)
+        return values
+
     def smooth_frontier(self, job_status):
         """Clamp a freshly-read job_status's LOCAL_FRONTIER to never
         report below the highest value seen so far this run."""
@@ -802,6 +836,27 @@ def parse_wallet_history(text):
     return events
 
 
+def parse_wallet_pending(text):
+    # "PENDING_TX direction=sent|received|self|fee-paid tx_hash=... version=...
+    #  nonce=... prime=... amount_micro_units=... amount_denominator=...
+    #  sender=... receiver=..." -- same shape as a TX_EVENT line but for a
+    # transaction still sitting in the peer's mempool: no integer/height
+    # (it isn't in a record yet) and no confirmations (it has none).
+    events = []
+    int_fields = {"nonce", "prime", "amount_micro_units", "amount_denominator"}
+    for line in text.splitlines():
+        if not line.startswith("PENDING_TX"):
+            continue
+        fields = {"pending": True}
+        for token in line.split()[1:]:
+            if "=" not in token:
+                continue
+            key, _, value = token.partition("=")
+            fields[key] = int(value) if key in int_fields and value.isdigit() else value
+        events.append(fields)
+    return events
+
+
 def find_default_bin_dir():
     """primewallet is a standalone tool -- it isn't nested inside a
     primechain checkout, so there's no single "correct" relative path to
@@ -1135,12 +1190,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _handle_wallet_history(self):
         # Transaction history, MetaMask-Activity-tab style. Unlike
-        # balances/holdings, there's no live network query for this --
-        # wallet-history reads it out of the *local* chain.dat replay,
-        # so it's only as current as the last sync (recall: mining is
-        # the only thing that runs sync-peer). Doesn't need unlock,
-        # same reasoning as balances: this is public on-chain data, not
-        # anything requiring the signing key.
+        # balances/holdings, there's no live network query for the
+        # confirmed part -- wallet-history reads it out of the *local*
+        # chain.dat replay, so it's only as current as the last sync
+        # (recall: mining is the only thing that runs sync-peer). Doesn't
+        # need unlock, same reasoning as balances: this is public
+        # on-chain data, not anything requiring the signing key.
+        #
+        # Pending (mempool, not yet in any record) transactions *are* a
+        # live query -- wallet-pending asks the peer directly, same as a
+        # balance check -- so a just-submitted send shows up immediately
+        # instead of only after it's mined and locally synced.
         qs = parse_qs(urlsplit(self.path).query)
         name = (qs.get("name", [""])[0]).strip()
         if not name:
@@ -1148,19 +1208,53 @@ class Handler(http.server.BaseHTTPRequestHandler):
         wallet_path = state.wallets.named_wallet_path(name)
         if not wallet_path.exists():
             raise CliError(f"no wallet named '{name}'")
-        chain_path = state.workdir / "data" / "chain.dat"
-        if not state.workdir_initialized() or not chain_path.exists():
-            self._send_json({"events": [], "synced": False})
-            return
         env = state.env_without_passphrase()
-        rc, out = run_binary(
+
+        # wallet-pending (a live peer query) and wallet-history (a full
+        # local chain.dat replay -- the slow one) don't depend on each
+        # other -- run them concurrently instead of paying both
+        # latencies back-to-back.
+        chain_path = state.workdir / "data" / "chain.dat"
+        history_needed = state.workdir_initialized() and chain_path.exists()
+        history_result = {}
+
+        def fetch_history():
+            rc, out = run_binary(
+                state.bin_dir / "primechain-client",
+                ["wallet-history", str(chain_path), str(wallet_path), "--last", "20"],
+                env,
+            )
+            history_result["rc"] = rc
+            history_result["out"] = out
+
+        history_thread = None
+        if history_needed:
+            history_thread = threading.Thread(target=fetch_history)
+            history_thread.start()
+
+        pending = []
+        rc_p, out_p = run_binary(
             state.bin_dir / "primechain-client",
-            ["wallet-history", str(chain_path), str(wallet_path), "--last", "20"],
+            ["wallet-pending", state.peer_host, str(state.peer_port), str(wallet_path)],
             env,
         )
-        if rc != 0:
-            raise CliError(f"could not read wallet history: {out.strip()}")
-        self._send_json({"events": parse_wallet_history(out), "synced": True})
+        if rc_p == 0:
+            pending = parse_wallet_pending(out_p)
+        # A failed pending check (peer rate-limited, timed out) shouldn't
+        # block showing confirmed history -- it just means this refresh
+        # can't say anything new about in-flight transactions.
+
+        if not history_needed:
+            self._send_json({"events": pending, "synced": False})
+            return
+        history_thread.join()
+        if history_result["rc"] != 0:
+            raise CliError(f"could not read wallet history: {history_result['out'].strip()}")
+        # wallet-history prints oldest-to-newest; the UI wants newest
+        # first, with still-pending (mempool) events on top of that
+        # since they're newer than anything already in a record.
+        confirmed = list(reversed(parse_wallet_history(history_result["out"])))
+        self._send_json({"events": pending + confirmed, "synced": True})
 
     def _handle_wallet_holdings(self):
         # A live GET_BALANCE query, same as the total-balance path -- but
@@ -1185,11 +1279,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         env = state.env_without_passphrase()
         address = state.wallets.address_of(name, state.bin_dir, env)
         rc, out = run_peer_query(state.bin_dir, state.peer_host, state.peer_port, ["GET_BALANCE", address], env)
+        stale = False
         if rc != 0:
-            raise CliError(f"could not read holdings: {out.strip()}")
-        rc2, policy_out = run_peer_query(state.bin_dir, state.peer_host, state.peer_port, ["GET_ECONOMIC_POLICY"], env)
-        fee = parse_economic_policy(policy_out).get("transfer_fee_micro_units") if rc2 == 0 else None
-        self._send_json({"address": address, "holdings": parse_holdings(out), "transfer_fee_micro_units": fee})
+            with state.holdings_lock:
+                cached = state.holdings_cache.get(name)
+            if cached is None:
+                raise CliError(f"could not read holdings: {out.strip()}")
+            holdings = cached[1]
+            stale = True
+        else:
+            holdings = parse_holdings(out)
+            with state.holdings_lock:
+                state.holdings_cache[name] = (time.monotonic(), holdings)
+        fee = state.get_economic_policy(env).get("transfer_fee_micro_units")
+        self._send_json({"address": address, "holdings": holdings, "transfer_fee_micro_units": fee, "stale": stale})
 
     def _handle_mining_start(self):
         state.start_mining()
