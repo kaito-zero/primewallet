@@ -1081,23 +1081,19 @@ def find_default_bin_dir():
     """primewallet is a standalone tool -- it isn't nested inside a
     primechain checkout, so there's no single "correct" relative path to
     the binaries. Try common locations next to this file and under the
-    current directory; fall back to a plain "build" (relative to cwd),
-    which validate_binaries() will report clearly if it's wrong."""
+    current directory, including "../primechain/build" (the natural
+    sibling-checkout layout the README's own clone instructions
+    produce); fall back to a plain "build" (relative to cwd), which
+    validate_binaries() will report clearly if it's wrong. If your
+    build lives somewhere else entirely (a fork, a dev branch checked
+    out under its own directory name, etc.), pass --bin-dir explicitly
+    rather than relying on auto-detection."""
     here = Path(__file__).resolve().parent
     candidates = [
         Path("build"),
         Path.cwd() / "build",
         here / "build",
         here.parent / "primechain" / "build",
-        here.parent / "primechain3" / "build",
-        here.parent / "primechain2" / "build",
-        # primechain-pr is an active development fork, rebuilt often --
-        # rebuilding it while it's the binaries a live run-jobs/sync-peer
-        # process is executing from can hit "Text file busy". It has
-        # useful not-yet-upstreamed fixes (e.g. rekey), so it's still a
-        # candidate, just last: point --bin-dir at it explicitly if you
-        # want it as the default instead.
-        here.parent / "primechain-pr" / "build",
     ]
     for candidate in candidates:
         if (candidate / "primechain-client").is_file():

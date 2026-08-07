@@ -37,7 +37,7 @@ python3 server.py
 
 Then open `http://127.0.0.1:8765/`. Workdir, peer, and passphrase are all set from the browser on first run.
 
-If the binaries aren't found automatically (checked under `./build` and a `build/` folder next to a few sibling primechain checkouts -- see `find_default_bin_dir()` in `server.py` for the exact search order), point at them directly:
+If the binaries aren't found automatically (checked under `./build` and `../primechain/build`, matching the clone layout above -- see `find_default_bin_dir()` in `server.py` for the exact search order), point at them directly:
 
 ```bash
 python3 server.py --bin-dir /path/to/primechain/build
