@@ -5,6 +5,18 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>primewallet</title>
 <link rel="stylesheet" href="/style.css">
+<script>
+// Applied synchronously, before the stylesheet paints anything, so a
+// saved "light" or "dark" choice never flashes the system default
+// first. "system" (or nothing saved yet) leaves the attribute unset,
+// which falls back to the :root{color-scheme:light dark} default.
+(function () {
+  try {
+    var t = localStorage.getItem("primewallet:theme");
+    if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+  } catch (e) {}
+})();
+</script>
 </head>
 <body>
 <div id="app" class="shell">
@@ -18,6 +30,7 @@
       </svg>
     </span> primewallet</div>
     <div class="topbar-actions">
+      <button id="theme-btn" class="icon-btn" title="theme: system" type="button">&#9680;</button>
       <button id="settings-btn" class="icon-btn" title="settings" type="button">&#9881;</button>
       <button id="lock-btn" class="icon-btn" title="lock wallet" type="button" disabled>&#128274;</button>
     </div>

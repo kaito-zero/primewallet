@@ -1,5 +1,12 @@
 :root {
   color-scheme: light dark;
+}
+/* Explicit user choice overrides the system default above -- everything
+   else in this file keeps using light-dark(...), it just resolves
+   against whichever color-scheme is in effect. */
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }
+:root {
   --border: light-dark(#e2e0e8, #34303f);
   --muted: light-dark(#6b6875, #9a97a6);
   --bg: light-dark(#f2f0f6, #131118);

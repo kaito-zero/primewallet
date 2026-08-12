@@ -6,6 +6,39 @@
 // primescan ever gets a real host, this is the one place to change it.
 const PRIMESCAN_BASE_URL = "http://127.0.0.1:8420";
 
+// -- theme (light / dark / system) --------------------------------------
+// The actual "system" default lives in style.css as color-scheme: light
+// dark on :root; picking light/dark here just sets a data-theme
+// attribute that a more specific selector overrides it with (see
+// style.css). The choice that matters for avoiding a flash on load is
+// applied inline in index.html's <head>, before this file even loads --
+// this only needs to handle changes made after the page is already up.
+const THEME_STORAGE_KEY = "primewallet:theme";
+const THEME_CYCLE = ["system", "light", "dark"];
+const THEME_ICON = { system: "◐", light: "☀", dark: "☾" };
+
+function currentTheme() {
+  try {
+    const t = localStorage.getItem(THEME_STORAGE_KEY);
+    return THEME_CYCLE.includes(t) ? t : "system";
+  } catch (e) {
+    return "system";
+  }
+}
+
+function applyTheme(theme) {
+  if (theme === "system") {
+    delete document.documentElement.dataset.theme;
+  } else {
+    document.documentElement.dataset.theme = theme;
+  }
+  const btn = el("theme-btn");
+  btn.textContent = THEME_ICON[theme];
+  btn.title = `theme: ${theme}`;
+}
+
+applyTheme(currentTheme());
+
 let logCursor = 0;
 let lastState = null;
 let settingsTouched = false;
@@ -704,6 +737,13 @@ function openSettings(tab) {
   switchSettingsTab(tab || "config");
 }
 
+el("theme-btn").addEventListener("click", () => {
+  const next = THEME_CYCLE[(THEME_CYCLE.indexOf(currentTheme()) + 1) % THEME_CYCLE.length];
+  try {
+    localStorage.setItem(THEME_STORAGE_KEY, next);
+  } catch (e) {}
+  applyTheme(next);
+});
 el("settings-btn").addEventListener("click", () => openSettings("config"));
 el("close-settings-btn").addEventListener("click", () => hide("settings-modal"));
 el("tab-btn-config").addEventListener("click", () => switchSettingsTab("config"));
