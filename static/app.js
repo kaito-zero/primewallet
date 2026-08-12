@@ -1,5 +1,11 @@
 "use strict";
 
+// primescan runs as its own local-only process (same 127.0.0.1-only
+// model as this app -- see server.py's own comment on that), so this is
+// a fixed default rather than something fetched from the backend. If
+// primescan ever gets a real host, this is the one place to change it.
+const PRIMESCAN_BASE_URL = "http://127.0.0.1:8420";
+
 let logCursor = 0;
 let lastState = null;
 let settingsTouched = false;
@@ -381,6 +387,26 @@ function renderActivityList(data) {
 
     row.appendChild(label);
     row.appendChild(amount);
+
+    // Link out to primescan for anything that's actually confirmed on
+    // chain -- a reward has no tx_hash (it's a ledger credit, not a
+    // transaction) so it links to the record itself; a pending event
+    // has neither yet, since it's still sitting in the peer's mempool
+    // and primescan only knows about its own synced local chain.
+    const primescanHref = isReward
+      ? (ev.integer != null ? `${PRIMESCAN_BASE_URL}/record/${ev.integer}` : null)
+      : (ev.tx_hash ? `${PRIMESCAN_BASE_URL}/tx/${ev.tx_hash}` : null);
+    if (primescanHref && !ev.pending) {
+      const link = document.createElement("a");
+      link.className = "activity-row-scan-link";
+      link.href = primescanHref;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.title = "View on primescan";
+      link.textContent = "↗";
+      row.appendChild(link);
+    }
+
     list.appendChild(row);
   }
 }

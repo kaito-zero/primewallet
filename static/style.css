@@ -6,7 +6,7 @@
   --card-bg: light-dark(#ffffff, #1c1926);
   --card-bg-alt: light-dark(#f7f6fa, #23202e);
   --text: light-dark(#1c1a24, #f0eef5);
-  --accent: light-dark(#6d28d9, #a78bfa);
+  --accent: light-dark(#2563eb, #60a5fa);
   --accent-contrast: #ffffff;
   --ok: light-dark(#15803d, #4ade80);
   --err: light-dark(#b91c1c, #f87171);
@@ -207,7 +207,11 @@ input[readonly] { opacity: 0.7; cursor: default; }
   border-radius: 50%;
   background: var(--card-bg-alt);
   margin: 0 auto 0.25rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
+.hero-icon svg { width: 1.6rem; height: 1.6rem; }
 .hero-card h1 { margin: 0; font-size: 1.3rem; }
 .hero-card p { margin: 0; }
 
@@ -388,6 +392,34 @@ input[readonly] { opacity: 0.7; cursor: default; }
 
 .action-row { display: flex; gap: 0.6rem; }
 
+.icon-action-btn {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.3rem;
+  background: var(--card-bg-alt);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 0.6rem 0.5rem 0.5rem;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+.icon-action-btn:hover:not(:disabled) { border-color: var(--accent); }
+.icon-action-btn:disabled { opacity: 0.5; cursor: default; }
+.icon-action-glyph {
+  width: 1.9rem;
+  height: 1.9rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--accent);
+  font-size: 1rem;
+}
+
 .account-activity {
   margin-top: 1rem;
   text-align: left;
@@ -412,7 +444,6 @@ input[readonly] { opacity: 0.7; cursor: default; }
 .activity-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 0.5rem;
   padding: 0.5rem 0.1rem;
   border-bottom: 1px solid var(--border);
@@ -420,12 +451,22 @@ input[readonly] { opacity: 0.7; cursor: default; }
 }
 .activity-row:last-child { border-bottom: none; }
 .activity-row-label {
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--text);
 }
 .activity-row-amount { flex-shrink: 0; font-weight: 600; font-family: ui-monospace, monospace; }
+.activity-row-scan-link {
+  flex-shrink: 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+  line-height: 1;
+  padding: 0.1rem 0.15rem;
+}
+.activity-row-scan-link:hover { color: var(--accent); }
 .activity-row.in .activity-row-amount { color: var(--ok); }
 .activity-row.out .activity-row-amount { color: var(--text); }
 .activity-row.fee .activity-row-amount,

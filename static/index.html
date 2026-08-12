@@ -10,7 +10,13 @@
 <div id="app" class="shell">
 
   <header class="topbar">
-    <div class="brand"><span class="brand-mark">&#9670;</span> primewallet</div>
+    <div class="brand"><span class="brand-mark">
+      <svg viewBox="0 0 32 40" width="20" height="20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <path d="M7 3 V37" stroke="currentColor" stroke-width="4" stroke-linecap="square"/>
+        <path d="M7 3 H22 V17 H11" stroke="currentColor" stroke-width="4" stroke-linecap="square" stroke-linejoin="miter" fill="none"/>
+        <rect x="3" y="7" width="8" height="8" fill="var(--bg)" stroke="#2563eb" stroke-width="2.5"/>
+      </svg>
+    </span> primewallet</div>
     <div class="topbar-actions">
       <button id="settings-btn" class="icon-btn" title="settings" type="button">&#9881;</button>
       <button id="lock-btn" class="icon-btn" title="lock wallet" type="button" disabled>&#128274;</button>
@@ -82,7 +88,13 @@
 
   <section id="unlock-screen" class="screen">
     <div class="hero-card">
-      <div class="hero-icon">&#9670;</div>
+      <div class="hero-icon">
+        <svg viewBox="0 0 32 40" width="24" height="24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+          <path d="M7 3 V37" stroke="currentColor" stroke-width="4" stroke-linecap="square"/>
+          <path d="M7 3 H22 V17 H11" stroke="currentColor" stroke-width="4" stroke-linecap="square" stroke-linejoin="miter" fill="none"/>
+          <rect x="3" y="7" width="8" height="8" fill="var(--card-bg-alt)" stroke="#2563eb" stroke-width="2.5"/>
+        </svg>
+      </div>
       <h1>Welcome back</h1>
       <p class="muted">Enter your wallet passphrase to unlock</p>
       <input id="passphrase-input" type="password" placeholder="Passphrase" autocomplete="current-password">
@@ -136,7 +148,7 @@
       </div>
       <div class="balance-row">
         <span id="account-balance" class="balance">0</span>
-        <span class="balance-label">micro-units</span>
+        <span class="balance-label">MRPC micro-units</span>
       </div>
 
       <div class="role-toggles">
@@ -149,9 +161,15 @@
       </div>
 
       <div class="action-row">
-        <button id="open-send-btn" class="secondary-btn" type="button">Send</button>
-        <button id="open-receive-btn" class="secondary-btn" type="button">Receive</button>
-        <button id="export-wallet-btn" class="secondary-btn" type="button">Export</button>
+        <button id="open-send-btn" class="icon-action-btn" type="button">
+          <span class="icon-action-glyph">&#8599;</span> Send
+        </button>
+        <button id="open-receive-btn" class="icon-action-btn" type="button">
+          <span class="icon-action-glyph">&#8595;</span> Receive
+        </button>
+        <button id="export-wallet-btn" class="icon-action-btn" type="button">
+          <span class="icon-action-glyph">&#9099;</span> Export
+        </button>
       </div>
 
       <div class="account-activity">
