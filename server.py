@@ -1240,6 +1240,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "/index.html": lambda: self._send_file(STATIC_DIR / "index.html", "text/html"),
             "/app.js": lambda: self._send_file(STATIC_DIR / "app.js", "application/javascript"),
             "/style.css": lambda: self._send_file(STATIC_DIR / "style.css", "text/css"),
+            "/favicon.svg": lambda: self._send_file(STATIC_DIR / "favicon.svg", "image/svg+xml"),
         }
         if path in routes:
             return routes[path]()
