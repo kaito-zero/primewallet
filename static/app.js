@@ -336,6 +336,29 @@ function renderAccountCard(state, name) {
 }
 
 let activityRequestId = 0;
+// Client-side filter over the already-fetched activity list -- switching
+// chips just re-renders from the cached response, no re-fetch needed.
+// Sticky across account switches on purpose (if you're looking for
+// "just my mining rewards", that preference almost certainly still
+// applies to the next account you look at too).
+let activityFilter = "all";
+let lastActivityData = null;
+
+function eventMatchesFilter(ev, filter) {
+  switch (filter) {
+    case "sent":
+      return !ev.reward && ev.direction !== "received" && ev.direction !== "fee-paid";
+    case "received":
+      return ev.direction === "received";
+    case "reward":
+      return !!ev.reward;
+    case "fee":
+      return ev.direction === "fee-paid";
+    case "all":
+    default:
+      return true;
+  }
+}
 
 async function refreshAccountActivity(name) {
   const requestId = ++activityRequestId; // an older, slower request must not overwrite a newer one
@@ -363,6 +386,7 @@ async function refreshAccountActivity(name) {
 }
 
 function renderActivityList(data) {
+  lastActivityData = data;
   const list = el("account-activity-list");
   list.innerHTML = "";
   const empty = (text) => {
@@ -372,12 +396,18 @@ function renderActivityList(data) {
     list.appendChild(p);
   };
   if (!data) return empty("-");
-  const events = data.events || [];
-  if (events.length === 0) {
+  const allEvents = data.events || [];
+  if (allEvents.length === 0) {
     // Pending events come from a live mempool query and don't need a
     // local sync -- only "nothing at all to show" depends on that.
     if (!data.synced) return empty("not synced locally yet -- start mining once to pull chain history");
     return empty("no activity yet");
+  }
+  const events = allEvents.filter((ev) => eventMatchesFilter(ev, activityFilter));
+  if (events.length === 0) {
+    // There IS activity, just none of this kind -- distinct from the
+    // genuinely-empty-account case above, which needs different guidance.
+    return empty(`no ${activityFilter} activity`);
   }
 
   // Already newest-first, pending on top -- see _handle_wallet_history.
@@ -1034,6 +1064,18 @@ onClick("copy-address-btn", async () => {
 el("refresh-activity-btn").addEventListener("click", () => {
   if (selectedWalletName) refreshAccountActivity(selectedWalletName);
 });
+
+for (const chip of document.querySelectorAll(".activity-filter-chip")) {
+  chip.addEventListener("click", () => {
+    activityFilter = chip.dataset.filter;
+    for (const other of document.querySelectorAll(".activity-filter-chip")) {
+      other.classList.toggle("active", other === chip);
+    }
+    // Re-render from the already-fetched data -- switching filters is a
+    // local view change, not a reason to hit the network/CLI again.
+    renderActivityList(lastActivityData);
+  });
+}
 
 el("toggle-prime").addEventListener("click", () => activateRole("prime"));
 el("toggle-composite").addEventListener("click", () => activateRole("composite"));

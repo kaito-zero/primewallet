@@ -1186,22 +1186,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _send_json(self, obj, status=200):
         body = json.dumps(obj).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # The client disconnected mid-response (closed the tab,
+            # navigated away, network blip) -- there's nobody left to
+            # send this to. Not an error worth surfacing: previously this
+            # propagated out of every caller (including _guarded's own
+            # except-Exception branch trying to report *this* failure,
+            # which then failed the same way trying to write to the same
+            # dead socket -- a double-fault that printed a full traceback
+            # to the log for what is completely routine client behavior).
+            pass
 
     def _send_file(self, path, content_type):
         try:
             data = path.read_bytes()
         except OSError:
             return self.send_error(404)
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _read_json_body(self):
         try:
